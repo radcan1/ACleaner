@@ -6,16 +6,22 @@ enum SoundPlayer {
 
     // App detected in Trash — attention-getting, like an incoming alert
     static func playDetected() {
-        NSSound(named: "Ping")?.play()
+        guard let s = NSSound(named: "Ping") else { return }
+        s.volume = 1.5
+        s.play()
     }
 
     // Scan finished — softer, "results are ready"
     static func playScanComplete() {
-        NSSound(named: "Pop")?.play()
+        guard let s = NSSound(named: "Pop") else { return }
+        s.volume = 1.5
+        s.play()
     }
 
     // Cleanup done — prominent success chime
     static func playCleanupComplete() {
-        NSSound(named: "Glass")?.play()
+        guard let s = NSSound(named: "Glass") else { return }
+        s.volume = 1.5
+        s.play()
     }
 }

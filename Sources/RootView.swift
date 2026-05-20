@@ -19,6 +19,7 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
 struct RootView: View {
     let cleanState: AppState
     @State private var selected: ACleanerTool? = .updater
+    @State private var showPermissions: Bool = !PermissionsChecker.allGranted
 
     var body: some View {
         NavigationSplitView {
@@ -47,5 +48,10 @@ struct RootView: View {
             }
         }
         .accessibilityLabel("ACleaner")
+        .sheet(isPresented: $showPermissions) {
+            PermissionsView {
+                showPermissions = false
+            }
+        }
     }
 }
