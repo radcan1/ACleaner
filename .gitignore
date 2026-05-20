@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build output (build.sh writes the .app to the Desktop)
+*.app/
+build/
+*.swiftmodule
+*.o
+*.dia
+
+# Editor / IDE
+.idea/
+*.xcuserstate
+xcuserdata/
+*.swp
