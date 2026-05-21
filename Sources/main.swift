@@ -16,11 +16,14 @@ let menuHandler = MenuHandler()
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var cleanState: AppState!
+    var updateChecker: UpdateChecker!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         cleanState = AppState()
         cleanState.startWatching()
         cleanState.loginItemEnabled = LoginItem.isEnabled
+
+        updateChecker = UpdateChecker()
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1060, height: 720),
@@ -31,9 +34,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "ACleaner"
         window.minSize = NSSize(width: 820, height: 540)
         window.center()
-        window.contentView = NSHostingView(rootView: RootView(cleanState: cleanState))
+        window.contentView = NSHostingView(
+            rootView: RootView(cleanState: cleanState)
+                .environmentObject(updateChecker)
+        )
         window.makeKeyAndOrderFront(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
+
+        // Check for updates after a short delay so it never slows launch
+        Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)  // 3 s
+            await updateChecker.check()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

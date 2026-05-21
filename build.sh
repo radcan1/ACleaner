@@ -20,6 +20,7 @@ swiftc \
   -O \
   "$SCRIPT_DIR/Sources/main.swift" \
   "$SCRIPT_DIR/Sources/RootView.swift" \
+  "$SCRIPT_DIR/Sources/UpdateChecker.swift" \
   "$SCRIPT_DIR/Sources/PermissionsChecker.swift" \
   "$SCRIPT_DIR/Sources/PermissionsView.swift" \
   \

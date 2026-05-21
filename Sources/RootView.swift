@@ -18,6 +18,7 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
 
 struct RootView: View {
     let cleanState: AppState
+    @EnvironmentObject var updateChecker: UpdateChecker
     @State private var selected: ACleanerTool? = .updater
 
     // Starts hidden. checkPermissionsIfNeeded() runs an async FDA test on first
@@ -26,7 +27,12 @@ struct RootView: View {
     @State private var showPermissions: Bool = false
 
     var body: some View {
-        NavigationSplitView {
+        VStack(spacing: 0) {
+            // Update banner — only visible when a newer release exists on GitHub
+            if let version = updateChecker.availableVersion {
+                updateBanner(version: version)
+            }
+            NavigationSplitView {
             List(ACleanerTool.allCases, selection: $selected) { tool in
                 Label(tool.rawValue, systemImage: tool.icon)
                     .tag(tool)
@@ -66,6 +72,39 @@ struct RootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .acleanerShowPermissions)) { _ in
             showPermissions = true
         }
+        } // end VStack
+    }
+
+    // MARK: - Update banner
+
+    private func updateBanner(version: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.down.circle.fill")
+                .foregroundColor(.accentColor)
+                .accessibilityHidden(true)
+            Text("ACleaner \(version) is available")
+                .fontWeight(.medium)
+            Spacer()
+            Button("Download Update") {
+                NSWorkspace.shared.open(updateChecker.releasePageURL)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .accessibilityHint("Opens the GitHub releases page in your browser.")
+            Button {
+                updateChecker.dismiss()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Dismiss update notification")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.accentColor.opacity(0.1))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Update available: ACleaner \(version). Download Update button.")
     }
 
     // MARK: - Permissions check
