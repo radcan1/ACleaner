@@ -19,9 +19,11 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
 struct RootView: View {
     let cleanState: AppState
     @State private var selected: ACleanerTool? = .updater
-    // Show permissions only on first-ever launch (UserDefaults persists the
-    // acknowledgment). FDA status is checked inside the sheet itself.
-    @State private var showPermissions: Bool = !PermissionsChecker.hasBeenAcknowledged
+
+    // Starts hidden. checkPermissionsIfNeeded() runs an async FDA test on first
+    // appear and raises the sheet only when FDA is definitively not granted.
+    // This mirrors Pearcleaner's pattern and eliminates false-positive flashes.
+    @State private var showPermissions: Bool = false
 
     var body: some View {
         NavigationSplitView {
@@ -50,13 +52,35 @@ struct RootView: View {
             }
         }
         .accessibilityLabel("ACleaner")
+        .onAppear { checkPermissionsIfNeeded() }
         .sheet(isPresented: $showPermissions) {
             PermissionsView {
                 showPermissions = false
             }
         }
+        // Switch to Clean Uninstall tab when the trash watcher detects an app
         .onReceive(NotificationCenter.default.publisher(for: .acleanerShowCleanUninstall)) { _ in
             selected = .cleanUninstall
+        }
+        // Re-open the permissions sheet from the menu bar item
+        .onReceive(NotificationCenter.default.publisher(for: .acleanerShowPermissions)) { _ in
+            showPermissions = true
+        }
+    }
+
+    // MARK: - Permissions check
+
+    private func checkPermissionsIfNeeded() {
+        PermissionsChecker.checkAsync { granted in
+            if granted {
+                // FDA confirmed — auto-acknowledge so we never bother the user again
+                PermissionsChecker.hasBeenAcknowledged = true
+            } else if !PermissionsChecker.hasBeenAcknowledged {
+                // First launch and FDA genuinely not granted — show the sheet
+                showPermissions = true
+            }
+            // If acknowledged but FDA was revoked (e.g., after an ad-hoc rebuild),
+            // stay quiet. The user can re-open the sheet via ACleaner > Privacy & Permissions.
         }
     }
 }

@@ -4,6 +4,15 @@ import SwiftUI
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 
+// Handles the "Privacy & Permissions" menu item — posts a notification that
+// RootView receives to re-open the permissions sheet.
+class MenuHandler: NSObject {
+    @objc func openPermissions(_ sender: Any?) {
+        NotificationCenter.default.post(name: .acleanerShowPermissions, object: nil)
+    }
+}
+let menuHandler = MenuHandler()
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var cleanState: AppState!
@@ -53,6 +62,14 @@ appMenu.addItem(NSMenuItem(
     action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
     keyEquivalent: ""
 ))
+appMenu.addItem(.separator())
+let permItem = NSMenuItem(
+    title: "Privacy & Permissions\u{2026}",
+    action: #selector(MenuHandler.openPermissions(_:)),
+    keyEquivalent: ""
+)
+permItem.target = menuHandler
+appMenu.addItem(permItem)
 appMenu.addItem(.separator())
 appMenu.addItem(NSMenuItem(
     title: "Quit ACleaner",

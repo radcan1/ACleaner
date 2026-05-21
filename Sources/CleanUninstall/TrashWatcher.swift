@@ -12,7 +12,9 @@ final class TrashWatcher: @unchecked Sendable {
     var onAppTrashed: (@Sendable (TrashedApp) -> Void)?
 
     private var streamRef: FSEventStreamRef?
-    private let queue = DispatchQueue.global()
+    // FSEvents requires a serial queue; DispatchQueue.global() is concurrent and
+    // can cause out-of-order delivery or subtle race conditions.
+    private let queue = DispatchQueue(label: "com.user.acleaner.trashwatcher", qos: .utility)
 
     private var watchedPath: String {
         FileManager.default.homeDirectoryForCurrentUser
@@ -24,9 +26,12 @@ final class TrashWatcher: @unchecked Sendable {
     let eventCallback: FSEventStreamCallback = { _, contextInfo, numEvents, eventPaths, _, _ in
         guard let contextInfo else { return }
         let watcher = Unmanaged<TrashWatcher>.fromOpaque(contextInfo).takeUnretainedValue()
-        let paths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue() as! [String]
+        // With kFSEventStreamCreateFlagUseCFTypes the paths parameter is a CFArray of CFStrings.
+        // unsafeBitCast is the standard Swift idiom for this; as! would crash on mismatch.
+        let pathsArray = unsafeBitCast(eventPaths, to: NSArray.self)
         for index in 0..<numEvents {
-            watcher.checkApp(path: paths[index])
+            guard let path = pathsArray[index] as? String else { continue }
+            watcher.checkApp(path: path)
         }
     }
 

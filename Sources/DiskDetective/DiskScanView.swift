@@ -28,19 +28,9 @@ struct DiskScanView: View {
 
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
 
-    /// Check Full Disk Access using files that exist on every Mac.
-    /// /var/db/.AppleSetupDone is created during macOS setup and is always present;
-    /// reading it requires FDA. We check without triggering a TCC prompt.
+    /// Delegates to PermissionsChecker so all FDA detection is in one place.
     private static func checkFullDiskAccess() -> Bool {
-        let fm = FileManager.default
-        // Primary: setup done marker — exists on every Mac, requires FDA
-        if fm.isReadableFile(atPath: "/var/db/.AppleSetupDone") { return true }
-        // Fallback: TCC database itself
-        if fm.isReadableFile(atPath: "/Library/Application Support/com.apple.TCC/TCC.db") { return true }
-        // Fallback: user Safari history (exists if Safari has been used)
-        let home = fm.homeDirectoryForCurrentUser.path
-        if fm.isReadableFile(atPath: home + "/Library/Safari/History.db") { return true }
-        return false
+        PermissionsChecker.hasFullDiskAccess
     }
 
     /// All categories discovered in scan results, in first-seen order.

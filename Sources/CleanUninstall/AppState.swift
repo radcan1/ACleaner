@@ -4,6 +4,7 @@ import Combine
 
 extension Notification.Name {
     static let acleanerShowCleanUninstall = Notification.Name("acleanerShowCleanUninstall")
+    static let acleanerShowPermissions    = Notification.Name("acleanerShowPermissions")
 }
 
 @MainActor
