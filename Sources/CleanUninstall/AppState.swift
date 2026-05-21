@@ -2,6 +2,10 @@ import Foundation
 import AppKit
 import Combine
 
+extension Notification.Name {
+    static let acleanerShowCleanUninstall = Notification.Name("acleanerShowCleanUninstall")
+}
+
 @MainActor
 final class AppState: ObservableObject {
     enum Phase: Equatable {
@@ -50,8 +54,11 @@ final class AppState: ObservableObject {
 
         phase = .detected(trashed)
         bringToFront()
+        // Switch the sidebar to the Clean Uninstall tab so the detection
+        // prompt is immediately visible, regardless of which tool was active.
+        NotificationCenter.default.post(name: .acleanerShowCleanUninstall, object: nil)
         SoundPlayer.playDetected()
-        announce("Warning: \(trashed.displayName) was moved to the Trash. Open CleanUninstall to remove its leftover files.")
+        announce("Warning: \(trashed.displayName) was moved to the Trash. ACleaner has switched to Clean Uninstall — review and remove its leftover files.")
     }
 
     func startScan(_ trashed: TrashedApp) {

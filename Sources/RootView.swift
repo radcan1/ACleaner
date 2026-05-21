@@ -19,7 +19,9 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
 struct RootView: View {
     let cleanState: AppState
     @State private var selected: ACleanerTool? = .updater
-    @State private var showPermissions: Bool = !PermissionsChecker.allGranted
+    // Show permissions only on first-ever launch (UserDefaults persists the
+    // acknowledgment). FDA status is checked inside the sheet itself.
+    @State private var showPermissions: Bool = !PermissionsChecker.hasBeenAcknowledged
 
     var body: some View {
         NavigationSplitView {
@@ -52,6 +54,9 @@ struct RootView: View {
             PermissionsView {
                 showPermissions = false
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .acleanerShowCleanUninstall)) { _ in
+            selected = .cleanUninstall
         }
     }
 }

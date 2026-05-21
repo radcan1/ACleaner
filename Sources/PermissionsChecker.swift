@@ -28,6 +28,15 @@ enum PermissionsChecker {
         NSWorkspace.shared.open(url)
     }
 
+    // MARK: - Acknowledgment persistence
+
+    /// True once the user has clicked Continue in the permissions sheet.
+    /// Stored in UserDefaults so the sheet is never shown again automatically.
+    static var hasBeenAcknowledged: Bool {
+        get { UserDefaults.standard.bool(forKey: "acleanerPermissionsAcknowledged") }
+        set { UserDefaults.standard.set(newValue, forKey: "acleanerPermissionsAcknowledged") }
+    }
+
     // MARK: - Overall readiness
 
     /// True when every permission ACleaner needs has been granted.

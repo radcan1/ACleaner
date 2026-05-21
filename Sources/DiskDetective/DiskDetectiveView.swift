@@ -2,14 +2,16 @@ import SwiftUI
 
 enum DiskTab: String, CaseIterable {
     case diskScan    = "Disk Scan"
+    case folderSize  = "Browse"
     case timeMachine = "Time Machine"
     case appCleaner  = "App Cleaner"
-    case orphans     = "Orphaned Files"
+    case orphans     = "Orphans"
     case history     = "History"
 
     var icon: String {
         switch self {
         case .diskScan:    return "internaldrive"
+        case .folderSize:  return "folder.badge.magnifyingglass"
         case .timeMachine: return "clock.arrow.circlepath"
         case .appCleaner:  return "app.badge.minus"
         case .orphans:     return "questionmark.folder"
@@ -45,6 +47,11 @@ struct DiskDetectiveView: View {
                     .opacity(selectedTab == .diskScan ? 1 : 0)
                     .allowsHitTesting(selectedTab == .diskScan)
                     .accessibilityHidden(selectedTab != .diskScan)
+
+                FolderSizeView()
+                    .opacity(selectedTab == .folderSize ? 1 : 0)
+                    .allowsHitTesting(selectedTab == .folderSize)
+                    .accessibilityHidden(selectedTab != .folderSize)
 
                 TimeMachineView()
                     .opacity(selectedTab == .timeMachine ? 1 : 0)

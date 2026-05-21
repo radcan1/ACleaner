@@ -44,6 +44,7 @@ swiftc \
   "$SCRIPT_DIR/Sources/DiskDetective/TimeMachineView.swift" \
   "$SCRIPT_DIR/Sources/DiskDetective/HistoryView.swift" \
   "$SCRIPT_DIR/Sources/DiskDetective/AppCleanerView.swift" \
+  "$SCRIPT_DIR/Sources/DiskDetective/FolderSizeView.swift" \
   \
   "$SCRIPT_DIR/Sources/CleanUninstall/AppState.swift" \
   "$SCRIPT_DIR/Sources/CleanUninstall/Cleaner.swift" \

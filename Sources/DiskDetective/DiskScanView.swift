@@ -253,33 +253,37 @@ struct DiskScanView: View {
                     let isCollapsed = collapsedCategories.contains(category)
                     let count       = indices(for: category).count
 
-                    Section {
-                        if !isCollapsed {
-                            ForEach(indices(for: category), id: \.self) { index in
-                                ScanItemRow(
-                                    item: Binding(
-                                        get: { engine.items[index] },
-                                        set: { engine.items[index] = $0 }
-                                    )
-                                )
+                    // Category header is a plain flat row — NOT a Section header.
+                    // Keeping everything at one level means VoiceOver never needs
+                    // to interact/uninteract to reach individual items underneath.
+                    CategoryHeader(
+                        category: category,
+                        count: count,
+                        bytesLabel: formatBytes(categoryBytes(for: category)),
+                        isCollapsed: isCollapsed,
+                        onToggleCollapse: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                if isCollapsed { collapsedCategories.remove(category) }
+                                else           { collapsedCategories.insert(category) }
                             }
+                        },
+                        onHide: {
+                            withAnimation { _ = excludedCategories.insert(category) }
                         }
-                    } header: {
-                        CategoryHeader(
-                            category: category,
-                            count: count,
-                            bytesLabel: formatBytes(categoryBytes(for: category)),
-                            isCollapsed: isCollapsed,
-                            onToggleCollapse: {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    if isCollapsed { collapsedCategories.remove(category) }
-                                    else           { collapsedCategories.insert(category) }
-                                }
-                            },
-                            onHide: {
-                                withAnimation { _ = excludedCategories.insert(category) }
-                            }
-                        )
+                    )
+                    .listRowBackground(Color(nsColor: .controlBackgroundColor))
+                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                    .listRowSeparator(.hidden)
+
+                    if !isCollapsed {
+                        ForEach(indices(for: category), id: \.self) { index in
+                            ScanItemRow(
+                                item: Binding(
+                                    get: { engine.items[index] },
+                                    set: { engine.items[index] = $0 }
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -673,6 +677,8 @@ struct ScanItemRow: View {
         .accessibilityLabel("\(item.name). \(item.detail). Path: \(item.displayPath). Size: \(item.sizeString). \(item.methodLabel).")
         .accessibilityValue(item.isSelected ? "checked" : "unchecked")
         .accessibilityAddTraits(.isButton)
+        // Default action fires on Enter / VO+Space — toggles selection
+        .accessibilityAction { item.isSelected.toggle() }
         .accessibilityAction(named: "Toggle selection") { item.isSelected.toggle() }
         .accessibilityAction(named: "Reveal in Finder") { revealInFinder() }
         .accessibilityAction(named: "Copy path") {
@@ -739,8 +745,11 @@ struct CategoryHeader: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(category), \(countLabel), \(bytesLabel). \(isCollapsed ? "Collapsed" : "Expanded"). Tap to \(isCollapsed ? "expand" : "collapse").")
+        .accessibilityLabel("\(category), \(countLabel), \(bytesLabel). \(isCollapsed ? "Collapsed" : "Expanded").")
         .accessibilityAddTraits(.isButton)
+        // Default action fires on Enter / VO+Space — expands or collapses
+        .accessibilityAction { onToggleCollapse() }
+        .accessibilityAction(named: isCollapsed ? "Expand" : "Collapse") { onToggleCollapse() }
         .accessibilityAction(named: "Hide category") { onHide() }
     }
 }

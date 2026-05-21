@@ -79,20 +79,38 @@ final class TrashWatcher: @unchecked Sendable {
 
     deinit { stop() }
 
-    // MARK: - Event handler (mirrors Pearcleaner's checkApp)
+    // MARK: - Event handler
 
     private func checkApp(path: String) {
-        let url = URL(fileURLWithPath: path)
-        guard url.pathExtension == "app" else { return }
-        guard let bundle = Bundle(url: url) else { return }
+        // FSEvents with FileEvents flag fires for every file inside an .app
+        // bundle, not just the bundle root — so we must walk up the path to
+        // find the enclosing .app directory rather than checking pathExtension
+        // on the raw event path.
+        guard let appURL = appBundleURL(from: path) else { return }
 
-        let bundleID = bundle.bundleIdentifier ?? ""
-        guard bundleID != "com.cleanuninstall.app" else { return }
-        guard FileManager.default.isInTrash(url) else { return }
-        guard let trashed = TrashedApp.from(trashURL: url) else { return }
+        let bundleID = Bundle(url: appURL)?.bundleIdentifier ?? ""
+        // Ignore our own bundle and the standalone CleanUninstall app
+        guard bundleID != "com.user.ACleaner",
+              bundleID != "com.cleanuninstall.app" else { return }
+        guard FileManager.default.isInTrash(appURL) else { return }
+        guard let trashed = TrashedApp.from(trashURL: appURL) else { return }
 
         let callback = onAppTrashed
         DispatchQueue.main.async { callback?(trashed) }
+    }
+
+    /// Extracts the .app bundle URL from an FSEvent path.
+    /// Handles both direct .app paths and paths to files inside a bundle.
+    private func appBundleURL(from path: String) -> URL? {
+        let url = URL(fileURLWithPath: path)
+        if url.pathExtension == "app" { return url }
+        // Walk up ancestors looking for a .app bundle
+        var candidate = url.deletingLastPathComponent()
+        while candidate.path != "/" {
+            if candidate.pathExtension == "app" { return candidate }
+            candidate = candidate.deletingLastPathComponent()
+        }
+        return nil
     }
 }
 

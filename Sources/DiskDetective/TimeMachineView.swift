@@ -57,36 +57,74 @@ class TimeMachineEngine: ObservableObject {
             : "\(snapshots.count) snapshot\(snapshots.count == 1 ? "" : "s") on disk"
     }
 
+    @Published var isDeleting = false
+
     func deleteSelected() async {
         let toDelete = snapshots.filter(\.isSelected)
         guard !toDelete.isEmpty else { return }
 
-        let commands = toDelete
-            .map { "sudo tmutil deletelocalsnapshots \($0.dateString)" }
-            .joined(separator: " && ")
+        isDeleting = true
         let countStr = "\(toDelete.count) snapshot\(toDelete.count == 1 ? "" : "s")"
-        let fullCmd = "\(commands) && echo '\\nDone — \(countStr) deleted.'"
+        feedbackMessage = "Deleting \(countStr)…"
 
-        let script = """
-        tell application "Terminal"
-            activate
-            do script "\(fullCmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))"
-        end tell
-        """
-        NSAppleScript(source: script)?.executeAndReturnError(nil)
+        // Chain all delete commands into one shell script so macOS only
+        // shows a single password prompt for the whole batch.
+        let command = toDelete
+            .map { "tmutil deletelocalsnapshots \($0.dateString)" }
+            .joined(separator: " && ")
 
-        feedbackMessage = "Terminal opened — \(countStr) queued for deletion. Your password may be required."
+        let (success, errMsg) = await runPrivileged(command)
+
+        if success {
+            let freed = toDelete.reduce(0) { $0 + $1.sizeBytes }
+            let sizeStr = freed > 0 ? " · \(formatBytes(freed)) freed" : ""
+            feedbackMessage = "\(countStr) deleted\(sizeStr)."
+            await loadSnapshots()
+        } else if errMsg.contains("-128") || errMsg.contains("cancelled") {
+            feedbackMessage = "Deletion cancelled."
+        } else {
+            feedbackMessage = "Error: \(errMsg)"
+        }
+
+        isDeleting = false
     }
 
     func deleteAll() async {
-        let script = """
-        tell application "Terminal"
-            activate
-            do script "sudo tmutil deletelocalsnapshots / && echo 'Done — all local snapshots deleted.'"
-        end tell
-        """
-        NSAppleScript(source: script)?.executeAndReturnError(nil)
-        feedbackMessage = "Terminal opened — all snapshots queued for deletion. Your password may be required."
+        isDeleting = true
+        feedbackMessage = "Deleting all snapshots…"
+
+        let (success, errMsg) = await runPrivileged("tmutil deletelocalsnapshots /")
+
+        if success {
+            feedbackMessage = "All local snapshots deleted."
+            await loadSnapshots()
+        } else if errMsg.contains("-128") || errMsg.contains("cancelled") {
+            feedbackMessage = "Deletion cancelled."
+        } else {
+            feedbackMessage = "Error: \(errMsg)"
+        }
+
+        isDeleting = false
+    }
+
+    // Runs a shell command via the macOS native admin-password dialog.
+    // Returns (success, errorMessage). Never opens Terminal.
+    private func runPrivileged(_ command: String) async -> (Bool, String) {
+        await Task.detached(priority: .userInitiated) {
+            let escaped = command
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let src = "do shell script \"\(escaped)\" with administrator privileges"
+            var errDict: NSDictionary?
+            NSAppleScript(source: src)?.executeAndReturnError(&errDict)
+            if let dict = errDict {
+                let msg = dict["NSAppleScriptErrorMessage"] as? String
+                    ?? dict["NSAppleScriptErrorNumber"].map { "\($0)" }
+                    ?? "unknown error"
+                return (false, msg)
+            }
+            return (true, "")
+        }.value
     }
 
     // MARK: - Helpers
@@ -183,20 +221,21 @@ struct TimeMachineView: View {
         }
         .task { await engine.loadSnapshots() }
         .alert("Delete All Snapshots?", isPresented: $showDeleteAllConfirm) {
-            Button("Open Terminal to Delete All", role: .destructive) {
+            Button("Delete All", role: .destructive) {
                 Task { await engine.deleteAll() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This will open Terminal and run:\nsudo tmutil deletelocalsnapshots /\n\nAll local snapshots will be removed. macOS will create new ones automatically.")
+            Text("All local Time Machine snapshots will be removed. macOS will create new ones automatically.\n\nYou will be asked for your password.")
         }
         .alert("Delete Selected Snapshots?", isPresented: $showDeleteSelectedConfirm) {
-            Button("Open Terminal to Delete", role: .destructive) {
+            Button("Delete \(selectedSnapshots.count) Snapshot\(selectedSnapshots.count == 1 ? "" : "s")", role: .destructive) {
                 Task { await engine.deleteSelected() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Terminal will open with the delete command for \(selectedSnapshots.count) snapshot\(selectedSnapshots.count == 1 ? "" : "s"). Your password will be required.")
+            let sizeHint = knownSizeTotal > 0 ? " (~\(formatBytes(knownSizeTotal)))" : ""
+            return Text("This will permanently delete \(selectedSnapshots.count) snapshot\(selectedSnapshots.count == 1 ? "" : "s")\(sizeHint).\n\nYou will be asked for your password once.")
         }
     }
 
@@ -255,14 +294,21 @@ struct TimeMachineView: View {
         } else {
             VStack(spacing: 0) {
                 if !engine.feedbackMessage.isEmpty {
-                    HStack {
-                        Image(systemName: "terminal")
+                    let isError   = engine.feedbackMessage.lowercased().hasPrefix("error")
+                    let isWorking = engine.isDeleting
+                    HStack(spacing: 8) {
+                        if isWorking {
+                            ProgressView().scaleEffect(0.75)
+                        } else {
+                            Image(systemName: isError ? "xmark.circle.fill" : "checkmark.circle.fill")
+                                .foregroundColor(isError ? .red : .green)
+                        }
                         Text(engine.feedbackMessage)
                             .font(.callout)
                     }
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.orange.opacity(0.1))
+                    .background(isError ? Color.red.opacity(0.08) : isWorking ? Color.blue.opacity(0.06) : Color.green.opacity(0.08))
                     .accessibilityLabel("Status: \(engine.feedbackMessage)")
                 }
 
@@ -332,19 +378,22 @@ struct TimeMachineView: View {
                     for i in engine.snapshots.indices { engine.snapshots[i].isSelected = true }
                 }
                 .buttonStyle(.borderless)
+                .disabled(engine.isDeleting)
 
                 Button("Deselect All") {
                     for i in engine.snapshots.indices { engine.snapshots[i].isSelected = false }
                 }
                 .buttonStyle(.borderless)
+                .disabled(engine.isDeleting)
 
                 Button("Delete All…") { showDeleteAllConfirm = true }
                     .buttonStyle(.bordered)
                     .foregroundColor(.red)
+                    .disabled(engine.isDeleting)
 
                 Button("Delete Selected…") { showDeleteSelectedConfirm = true }
                     .buttonStyle(.borderedProminent)
-                    .disabled(selectedSnapshots.isEmpty)
+                    .disabled(selectedSnapshots.isEmpty || engine.isDeleting)
             }
         }
         .padding(.horizontal, 16)
