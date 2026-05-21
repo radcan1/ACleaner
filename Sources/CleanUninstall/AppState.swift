@@ -102,6 +102,53 @@ final class AppState: ObservableObject {
         selection = []
     }
 
+    // MARK: - Direct uninstall (user-initiated, no need to drag to Trash first)
+
+    /// Moves `appURL` to the Trash, then enters the detected phase so the user can
+    /// scan for and remove leftover files.  Returns a non-nil error message if the
+    /// operation fails so the caller can show it in a visible alert.
+    @discardableResult
+    func trashAndScan(appURL: URL) -> String? {
+        let displayName = appURL.deletingPathExtension().lastPathComponent
+
+        var resultNSURL: NSURL?
+        do {
+            try FileManager.default.trashItem(at: appURL, resultingItemURL: &resultNSURL)
+        } catch {
+            let msg = "Could not move \(displayName) to the Trash: \(error.localizedDescription)"
+            announce(msg)
+            return msg
+        }
+
+        // resultingItemURL may be nil on some macOS versions even on success.
+        // Fall back to reconstructing the expected Trash path.
+        let trashedPath: URL
+        if let found = resultNSURL as URL? {
+            trashedPath = found
+        } else {
+            let trashDir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".Trash")
+            trashedPath = trashDir.appendingPathComponent(appURL.lastPathComponent)
+        }
+
+        guard let trashed = TrashedApp.from(trashURL: trashedPath) else {
+            let msg = "Moved \(displayName) to the Trash but could not read its bundle info."
+            announce(msg)
+            return msg
+        }
+
+        // Register the trashed path so TrashWatcher doesn't fire a duplicate event.
+        seenPaths.insert(trashedPath.path)
+
+        recentEvents.insert("Uninstalled \(trashed.displayName)", at: 0)
+        if recentEvents.count > 20 { recentEvents.removeLast() }
+
+        phase = .detected(trashed)
+        SoundPlayer.playDetected()
+        announce("Moved \(trashed.displayName) to the Trash. Press Scan for leftover files to continue.")
+        return nil
+    }
+
     func setLoginItem(_ on: Bool) {
         do {
             try LoginItem.set(enabled: on)

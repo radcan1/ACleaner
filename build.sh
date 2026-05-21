@@ -47,6 +47,7 @@ swiftc \
   "$SCRIPT_DIR/Sources/DiskDetective/FolderSizeView.swift" \
   \
   "$SCRIPT_DIR/Sources/CleanUninstall/AppState.swift" \
+  "$SCRIPT_DIR/Sources/CleanUninstall/InstalledAppsView.swift" \
   "$SCRIPT_DIR/Sources/CleanUninstall/Cleaner.swift" \
   "$SCRIPT_DIR/Sources/CleanUninstall/LoginItem.swift" \
   "$SCRIPT_DIR/Sources/CleanUninstall/SoundPlayer.swift" \

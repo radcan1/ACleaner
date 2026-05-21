@@ -2,6 +2,11 @@ import SwiftUI
 
 struct MainView: View {
     @EnvironmentObject var state: AppState
+    // ── App picker lives here, not in IdleView ────────────────────────────────
+    // Keeping the sheet on this view (which is always in the hierarchy) prevents
+    // it from being torn down when the phase switches from .idle to .detected.
+    @State private var showAppPicker = false
+    @State private var trashError: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -11,11 +16,29 @@ struct MainView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding()
+        // Sheet is owned by MainView so it survives the .idle → .detected transition
+        .sheet(isPresented: $showAppPicker) {
+            AppPickerSheet { appURL in
+                if let err = state.trashAndScan(appURL: appURL) {
+                    trashError = err
+                }
+            }
+        }
+        .alert("Could Not Uninstall App", isPresented: Binding(
+            get: { trashError != nil },
+            set: { if !$0 { trashError = nil } }
+        )) {
+            Button("OK", role: .cancel) { trashError = nil }
+        } message: {
+            Text(trashError ?? "")
+        }
     }
+
+    // MARK: Header
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text("CleanUninstall")
+            Text("Clean Uninstall")
                 .font(.title)
                 .accessibilityAddTraits(.isHeader)
             Spacer()
@@ -34,11 +57,13 @@ struct MainView: View {
         .padding(.bottom, 8)
     }
 
+    // MARK: Content
+
     @ViewBuilder
     private var content: some View {
         switch state.phase {
         case .idle:
-            IdleView()
+            IdleView(showAppPicker: $showAppPicker)
         case .detected(let app):
             DetectionView(app: app)
         case .scanning(let app):
@@ -53,22 +78,56 @@ struct MainView: View {
     }
 }
 
+// MARK: - Idle
+
 struct IdleView: View {
     @EnvironmentObject var state: AppState
+    @Binding var showAppPicker: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(state.watchEnabled
-                 ? "Watching the Trash. When you move an application to the Trash, CleanUninstall will appear and offer to clean up its leftover files."
-                 : "Watching is currently off. Turn on the Watch Trash switch to enable detection.")
-                .font(.body)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(state.watchEnabled
-                                    ? "CleanUninstall is watching the Trash. Move an application to the Trash to begin."
-                                    : "Watching is off. Turn on the Watch Trash switch to start.")
+        VStack(alignment: .leading, spacing: 16) {
 
-            Text("Recent events").font(.headline).accessibilityAddTraits(.isHeader)
+            // ── Direct uninstall ──────────────────────────────────────────
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Uninstall an App")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                Text("Select any installed application and ACleaner will move it to the Trash then scan for its leftover files — no dragging required.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Choose App to Uninstall\u{2026}") {
+                    showAppPicker = true
+                }
+                .controlSize(.large)
+                .keyboardShortcut("u", modifiers: .command)
+                .accessibilityHint("Opens a searchable list of installed apps. Press Enter on an app to move it to the Trash and scan for leftovers. Shortcut: Command-U.")
+            }
+            .padding(14)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .cornerRadius(10)
+            .overlay(RoundedRectangle(cornerRadius: 10)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1))
+
+            Divider()
+
+            // ── Trash watcher status ──────────────────────────────────────
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Trash Watcher")
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                Text(state.watchEnabled
+                     ? "Watching the Trash. When you move an app to the Trash, ACleaner will offer to remove its leftover files automatically."
+                     : "Watching is off. Turn on the Watch Trash switch to enable automatic detection.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // ── Recent events ─────────────────────────────────────────────
+            Text("Recent events")
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
             if state.recentEvents.isEmpty {
                 Text("No applications detected yet.")
                     .foregroundStyle(.secondary)
@@ -79,10 +138,13 @@ struct IdleView: View {
                 .accessibilityLabel("Recent detection events")
                 .frame(minHeight: 120)
             }
+
             Spacer(minLength: 0)
         }
     }
 }
+
+// MARK: - Detection
 
 struct DetectionView: View {
     let app: TrashedApp
@@ -94,7 +156,7 @@ struct DetectionView: View {
                 .font(.title2)
                 .accessibilityAddTraits(.isHeader)
 
-            Text("Would you like CleanUninstall to find and remove the application's leftover files such as preferences, caches, and support data?")
+            Text("Would you like ACleaner to find and remove the application's leftover files such as preferences, caches, and support data?")
                 .fixedSize(horizontal: false, vertical: true)
 
             if let bundleID = app.bundleIdentifier {
@@ -119,6 +181,8 @@ struct DetectionView: View {
     }
 }
 
+// MARK: - Scanning
+
 struct ScanningView: View {
     let app: TrashedApp
 
@@ -137,6 +201,8 @@ struct ScanningView: View {
     }
 }
 
+// MARK: - Progress message
+
 struct ProgressMessageView: View {
     let message: String
     var body: some View {
@@ -147,6 +213,8 @@ struct ProgressMessageView: View {
         }
     }
 }
+
+// MARK: - Results
 
 struct ResultsView: View {
     let app: TrashedApp
@@ -231,6 +299,8 @@ struct ResultsView: View {
     }
 }
 
+// MARK: - Done
+
 struct DoneView: View {
     let removed: Int
     let failed: [String]
@@ -243,7 +313,6 @@ struct DoneView: View {
                 .accessibilityAddTraits(.isHeader)
 
             Text("Moved \(removed) item\(removed == 1 ? "" : "s") to the Trash.")
-                .accessibilityLabel("Moved \(removed) item\(removed == 1 ? "" : "s") to the Trash.")
 
             if !failed.isEmpty {
                 Text("Items that could not be removed:")
