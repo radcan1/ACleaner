@@ -1,94 +1,72 @@
 import Foundation
-import CoreServices
 
-/// Watches ~/.Trash for newly added .app bundles using directory-level FSEvents.
+/// Watches ~/.Trash for newly added .app bundles using a kqueue DispatchSource.
 ///
 /// Design:
+///   - Opens ~/.Trash with O_EVTONLY (no data access, no FDA required).
+///   - DispatchSource.write fires once per directory modification — no per-file
+///     callback storms like FSEvents with kFSEventStreamCreateFlagFileEvents.
 ///   - Seeds knownPaths on start() so pre-existing Trash contents are ignored.
-///   - Uses directory-level events (no kFSEventStreamCreateFlagFileEvents) to
-///     avoid thousands of callbacks per large app bundle.
-///   - 0.5 s coalesce window lets large bundles fully land before we read them.
-///   - Runs on a dedicated serial queue — FSEvents requirement.
+///   - Short settle delay (0.4 s) lets the bundle fully land before we read it.
 final class TrashWatcher: @unchecked Sendable {
     var onAppTrashed: (@Sendable (TrashedApp) -> Void)?
 
-    private var streamRef: FSEventStreamRef?
+    private var watchSource: DispatchSourceFileSystemObject?
     private let queue = DispatchQueue(label: "com.user.acleaner.trashwatcher", qos: .utility)
-    /// Paths already in ~/.Trash when start() was called — not reported to the callback.
     private var knownPaths: Set<String> = []
+    private var dirFD: Int32 = -1
 
     private var trashPath: String {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".Trash").path
     }
 
-    // MARK: Stored C callbacks
-    // Must be stored properties so the pointer remains valid for the lifetime
-    // of the FSEventStream.
-
-    let eventCallback: FSEventStreamCallback = { _, contextInfo, _, _, _, _ in
-        guard let contextInfo else { return }
-        let watcher = Unmanaged<TrashWatcher>.fromOpaque(contextInfo).takeUnretainedValue()
-        watcher.scanForNewApps()
-    }
-
-    let retainCallback: CFAllocatorRetainCallBack = { info in
-        guard let info else { return nil }
-        _ = Unmanaged<TrashWatcher>.fromOpaque(info).retain()
-        return info
-    }
-
-    let releaseCallback: CFAllocatorReleaseCallBack = { info in
-        guard let info else { return }
-        Unmanaged<TrashWatcher>.fromOpaque(info).release()
-    }
-
     // MARK: - Start / Stop
 
     func start() {
-        guard streamRef == nil else { return }
+        guard watchSource == nil else { return }
 
-        // Seed before starting so anything already in the Trash is ignored.
+        // Seed so anything already in the Trash is never reported.
         let existing = (try? FileManager.default.contentsOfDirectory(atPath: trashPath)) ?? []
         knownPaths = Set(existing.map { trashPath + "/" + $0 })
 
-        var context = FSEventStreamContext(
-            version: 0,
-            info: Unmanaged.passUnretained(self).toOpaque(),
-            retain: retainCallback,
-            release: releaseCallback,
-            copyDescription: nil
+        // O_EVTONLY: open for event notification only — no data access, no prompts.
+        let fd = open(trashPath, O_EVTONLY)
+        guard fd >= 0 else { return }
+        dirFD = fd
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: .write,   // fires whenever an item is added or removed
+            queue: queue
         )
 
-        guard let stream = FSEventStreamCreate(
-            kCFAllocatorDefault,
-            eventCallback,
-            &context,
-            [trashPath] as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.5,   // coalesce window (seconds) — large apps need time to fully land
-            UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer)
-        ) else { return }
+        source.setEventHandler { [weak self] in
+            // Brief settle: let the bundle fully appear in the directory listing.
+            self?.queue.asyncAfter(deadline: .now() + 0.4) {
+                self?.scanForNewApps()
+            }
+        }
 
-        FSEventStreamSetDispatchQueue(stream, queue)
-        FSEventStreamStart(stream)
-        streamRef = stream
+        source.setCancelHandler { [weak self] in
+            guard let self else { return }
+            if self.dirFD >= 0 { close(self.dirFD); self.dirFD = -1 }
+        }
+
+        source.resume()
+        watchSource = source
     }
 
     func stop() {
-        guard let s = streamRef else { return }
-        FSEventStreamStop(s)
-        FSEventStreamInvalidate(s)
-        FSEventStreamRelease(s)
-        streamRef = nil
+        watchSource?.cancel()
+        watchSource = nil
     }
 
     deinit { stop() }
 
-    // MARK: - Private
+    // MARK: - Scan
 
-    /// Scans ~/.Trash for .app bundles that weren't there on start().
-    /// Called on our serial FSEvents queue; safe to mutate knownPaths here.
+    /// Called on our serial queue after the settle delay.
     private func scanForNewApps() {
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: trashPath)) ?? []
         for name in entries where name.hasSuffix(".app") {
@@ -99,7 +77,7 @@ final class TrashWatcher: @unchecked Sendable {
             let url = URL(fileURLWithPath: path)
             guard let trashed = TrashedApp.from(trashURL: url) else { continue }
 
-            // Skip ACleaner itself
+            // Never fire for ACleaner itself.
             let bundleID = trashed.bundleIdentifier ?? ""
             guard bundleID != "com.user.ACleaner",
                   bundleID != "com.cleanuninstall.app" else { continue }
