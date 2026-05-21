@@ -11,6 +11,7 @@ extension Notification.Name {
 final class AppState: ObservableObject {
     enum Phase: Equatable {
         case idle
+        case trashing(String)               // displayName — shown while password dialog is open
         case detected(TrashedApp)
         case scanning(TrashedApp)
         case results(TrashedApp, [LeftoverFile])
@@ -23,17 +24,21 @@ final class AppState: ObservableObject {
     @Published var watchEnabled: Bool = true
     @Published var loginItemEnabled: Bool = false
     @Published var recentEvents: [String] = []
+    /// Non-nil when trashAndScan fails; MainView binds an alert to this.
+    @Published var trashingError: String? = nil
 
     private let watcher = TrashWatcher()
     private let scanner = LeftoverScanner()
     private var seenPaths: Set<String> = []
+
+    // MARK: - Trash watcher
 
     func startWatching() {
         watcher.onAppTrashed = { [weak self] trashed in
             Task { @MainActor in self?.handleTrashed(trashed) }
         }
         watcher.start()
-        announce("CleanUninstall is watching the Trash for applications.")
+        announce("Clean Uninstall is watching the Trash for applications.")
     }
 
     func stopWatching() {
@@ -55,12 +60,12 @@ final class AppState: ObservableObject {
 
         phase = .detected(trashed)
         bringToFront()
-        // Switch the sidebar to the Clean Uninstall tab so the detection
-        // prompt is immediately visible, regardless of which tool was active.
         NotificationCenter.default.post(name: .acleanerShowCleanUninstall, object: nil)
         SoundPlayer.playDetected()
         announce("Warning: \(trashed.displayName) was moved to the Trash. ACleaner has switched to Clean Uninstall — review and remove its leftover files.")
     }
+
+    // MARK: - Scan / cleanup
 
     func startScan(_ trashed: TrashedApp) {
         phase = .scanning(trashed)
@@ -91,7 +96,9 @@ final class AppState: ObservableObject {
                 self.phase = .done(removed: outcome.removed, failed: outcome.failed)
                 self.selection = []
                 SoundPlayer.playCleanupComplete()
-                let failedNote = outcome.failed.isEmpty ? "" : ". \(outcome.failed.count) item\(outcome.failed.count == 1 ? "" : "s") could not be removed."
+                let failedNote = outcome.failed.isEmpty
+                    ? ""
+                    : ". \(outcome.failed.count) item\(outcome.failed.count == 1 ? "" : "s") could not be removed."
                 self.announce("Cleanup finished. Removed \(outcome.removed) item\(outcome.removed == 1 ? "" : "s")\(failedNote)")
             }
         }
@@ -102,58 +109,113 @@ final class AppState: ObservableObject {
         selection = []
     }
 
-    // MARK: - Direct uninstall (user-initiated, no need to drag to Trash first)
+    // MARK: - Direct uninstall (user-initiated, no Trash drag needed)
 
-    /// Moves `appURL` to the Trash, then enters the detected phase so the user can
-    /// scan for and remove leftover files.  Returns a non-nil error message if the
-    /// operation fails so the caller can show it in a visible alert.
-    @discardableResult
-    func trashAndScan(appURL: URL) -> String? {
+    /// Moves `appURL` to the Trash, showing a progress screen while any macOS
+    /// password dialog is open.
+    ///
+    /// Strategy:
+    ///   1. Try `FileManager.trashItem` — fast, silent, works for user-owned apps.
+    ///   2. On permission failure, delegate to Finder via AppleScript.
+    ///      Finder holds the elevated rights and will show macOS's own
+    ///      authentication dialog if needed (same dialog you see in Finder).
+    func trashAndScan(appURL: URL) {
         let displayName = appURL.deletingPathExtension().lastPathComponent
+        phase = .trashing(displayName)
+        announce("Moving \(displayName) to the Trash.")
 
-        var resultNSURL: NSURL?
-        do {
-            try FileManager.default.trashItem(at: appURL, resultingItemURL: &resultNSURL)
-        } catch {
-            let msg = "Could not move \(displayName) to the Trash: \(error.localizedDescription)"
-            announce(msg)
-            return msg
+        Task {
+            // ── Step 1: fast FileManager path ───────────────────────────────
+            var resultNSURL: NSURL?
+            var needsElevation = false
+            do {
+                try FileManager.default.trashItem(at: appURL, resultingItemURL: &resultNSURL)
+            } catch {
+                needsElevation = true
+            }
+
+            // ── Step 2: Finder fallback (shows macOS password dialog) ────────
+            if needsElevation {
+                let path   = appURL.path
+                // Raw-string literal keeps the double quotes literal inside AppleScript
+                let source = #"tell application "Finder" to move POSIX file "\#(path)" to trash"#
+
+                let finderErrMsg: String? = await Task.detached(priority: .userInitiated) {
+                    var dict: NSDictionary?
+                    NSAppleScript(source: source)?.executeAndReturnError(&dict)
+                    return dict?["NSAppleScriptErrorMessage"] as? String
+                }.value
+
+                if let errMsg = finderErrMsg {
+                    phase = .idle
+                    trashingError = "Could not move \"\(displayName)\" to the Trash.\n\n\(errMsg)"
+                    announce("Could not move \(displayName) to the Trash.")
+                    return
+                }
+                // Finder succeeded but gives us no resulting URL — use findInTrash.
+                resultNSURL = nil
+            }
+
+            // ── Step 3: resolve the resulting Trash URL ──────────────────────
+            let trashedURL: URL
+            if let found = resultNSURL as URL? {
+                trashedURL = found
+            } else {
+                guard let found = findInTrash(originalURL: appURL) else {
+                    phase = .idle
+                    trashingError = "Moved \"\(displayName)\" to the Trash but could not locate it there."
+                    return
+                }
+                trashedURL = found
+            }
+
+            // ── Step 4: build TrashedApp and enter the detection workflow ─────
+            guard let trashed = TrashedApp.from(trashURL: trashedURL) else {
+                phase = .idle
+                trashingError = "Moved \"\(displayName)\" to the Trash but could not read its bundle info."
+                return
+            }
+
+            // Prevent TrashWatcher from firing a duplicate event for the same path.
+            seenPaths.insert(trashedURL.path)
+
+            recentEvents.insert("Uninstalled \(trashed.displayName)", at: 0)
+            if recentEvents.count > 20 { recentEvents.removeLast() }
+
+            phase = .detected(trashed)
+            SoundPlayer.playDetected()
+            announce("Moved \(trashed.displayName) to the Trash. Press Scan for leftover files to continue.")
         }
+    }
 
-        // resultingItemURL may be nil on some macOS versions even on success.
-        // Fall back to reconstructing the expected Trash path.
-        let trashedPath: URL
-        if let found = resultNSURL as URL? {
-            trashedPath = found
-        } else {
-            let trashDir = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".Trash")
-            trashedPath = trashDir.appendingPathComponent(appURL.lastPathComponent)
+    // MARK: - Helpers
+
+    /// Finds `originalURL.lastPathComponent` in ~/.Trash, including Finder's
+    /// numeric rename ("GarageBand 2.app") if the name was already taken.
+    private func findInTrash(originalURL: URL) -> URL? {
+        let fm       = FileManager.default
+        let trashDir = fm.homeDirectoryForCurrentUser.appendingPathComponent(".Trash")
+        let appName  = originalURL.deletingPathExtension().lastPathComponent
+
+        // Exact name first
+        let exact = trashDir.appendingPathComponent(originalURL.lastPathComponent)
+        if fm.fileExists(atPath: exact.path) { return exact }
+
+        // Finder may have renamed it ("GarageBand 2.app")
+        let contents = (try? fm.contentsOfDirectory(
+            at: trashDir, includingPropertiesForKeys: nil,
+            options: .skipsHiddenFiles)) ?? []
+        return contents.first {
+            $0.pathExtension == "app" &&
+            $0.deletingPathExtension().lastPathComponent.hasPrefix(appName)
         }
-
-        guard let trashed = TrashedApp.from(trashURL: trashedPath) else {
-            let msg = "Moved \(displayName) to the Trash but could not read its bundle info."
-            announce(msg)
-            return msg
-        }
-
-        // Register the trashed path so TrashWatcher doesn't fire a duplicate event.
-        seenPaths.insert(trashedPath.path)
-
-        recentEvents.insert("Uninstalled \(trashed.displayName)", at: 0)
-        if recentEvents.count > 20 { recentEvents.removeLast() }
-
-        phase = .detected(trashed)
-        SoundPlayer.playDetected()
-        announce("Moved \(trashed.displayName) to the Trash. Press Scan for leftover files to continue.")
-        return nil
     }
 
     func setLoginItem(_ on: Bool) {
         do {
             try LoginItem.set(enabled: on)
             loginItemEnabled = LoginItem.isEnabled
-            announce(on ? "CleanUninstall will start at login." : "CleanUninstall will no longer start at login.")
+            announce(on ? "Clean Uninstall will start at login." : "Clean Uninstall will no longer start at login.")
         } catch {
             announce("Could not change login-item setting: \(error.localizedDescription)")
         }

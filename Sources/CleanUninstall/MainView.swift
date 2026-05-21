@@ -6,7 +6,6 @@ struct MainView: View {
     // Keeping the sheet on this view (which is always in the hierarchy) prevents
     // it from being torn down when the phase switches from .idle to .detected.
     @State private var showAppPicker = false
-    @State private var trashError: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -19,18 +18,17 @@ struct MainView: View {
         // Sheet is owned by MainView so it survives the .idle → .detected transition
         .sheet(isPresented: $showAppPicker) {
             AppPickerSheet { appURL in
-                if let err = state.trashAndScan(appURL: appURL) {
-                    trashError = err
-                }
+                state.trashAndScan(appURL: appURL)
             }
         }
+        // Error alert — populated by AppState when the trash operation fails
         .alert("Could Not Uninstall App", isPresented: Binding(
-            get: { trashError != nil },
-            set: { if !$0 { trashError = nil } }
+            get:  { state.trashingError != nil },
+            set:  { if !$0 { state.trashingError = nil } }
         )) {
-            Button("OK", role: .cancel) { trashError = nil }
+            Button("OK", role: .cancel) { state.trashingError = nil }
         } message: {
-            Text(trashError ?? "")
+            Text(state.trashingError ?? "")
         }
     }
 
@@ -64,6 +62,8 @@ struct MainView: View {
         switch state.phase {
         case .idle:
             IdleView(showAppPicker: $showAppPicker)
+        case .trashing(let name):
+            ProgressMessageView(message: "Moving \"\(name)\" to the Trash\u{2026}")
         case .detected(let app):
             DetectionView(app: app)
         case .scanning(let app):
