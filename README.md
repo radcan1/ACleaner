@@ -1,5 +1,11 @@
 # ACleaner
 
+**[⬇ Download ACleaner.zip — v1.0.0](https://github.com/radcan1/ACleaner/releases/download/v1.0.0/ACleaner.zip)**
+
+> Unzip, double-click ACleaner.app. If macOS says the developer cannot be verified, right-click the app → **Open** → **Open**.
+
+---
+
 A **VoiceOver-first** macOS maintenance suite that bundles three tools into one native app:
 
 - **Updater** — keep Homebrew and Mac App Store apps up to date
@@ -95,7 +101,16 @@ On first launch, ACleaner shows a one-time permissions screen. Granting **Full D
 
 ## Install
 
-### Option 1 — Build from source (recommended)
+### Option 1 — Download (easiest)
+
+1. **[Download ACleaner.zip](https://github.com/radcan1/ACleaner/releases/download/v1.0.0/ACleaner.zip)**
+2. Unzip it (double-click the zip)
+3. Drag `ACleaner.app` anywhere — Desktop, Applications, wherever you like
+4. Double-click to open
+
+**First launch only:** macOS will say *"ACleaner cannot be opened because the developer cannot be verified."* This is normal for apps outside the App Store. Right-click (or Control-click) the app → **Open** → **Open** in the dialog. You only need to do this once.
+
+### Option 2 — Build from source
 
 ```bash
 git clone https://github.com/radcan1/ACleaner.git
@@ -103,15 +118,7 @@ cd ACleaner
 ./build.sh
 ```
 
-`build.sh` compiles the app with `swiftc`, writes `ACleaner.app` to your Desktop, signs it with your development certificate if available, and opens it. No Gatekeeper prompt when built locally. No Xcode project needed.
-
-### Option 2 — Download a release
-
-Go to the [Releases](../../releases) page, download `ACleaner.zip`, unpack it, and drag `ACleaner.app` to `/Applications`. Then clear the quarantine flag so Gatekeeper allows it:
-
-```bash
-xattr -dr com.apple.quarantine /Applications/ACleaner.app
-```
+Compiles the app with `swiftc` and places `ACleaner.app` on your Desktop. Requires Xcode command-line tools (`xcode-select --install`).
 
 ---
 
