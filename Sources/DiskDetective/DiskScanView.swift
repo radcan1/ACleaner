@@ -20,6 +20,9 @@ struct DiskScanView: View {
     @State private var excludedCategories: Set<String> = []
     @State private var showCategoryFilter = false
 
+    // Safety snapshot prompt — shown before the delete confirmation
+    @State private var showSnapshotPrompt = false
+
     private var selectedItems: [ScanItem] { engine.items.filter(\.isSelected) }
     private var selectedBytes: Int64 { selectedItems.reduce(0) { $0 + $1.sizeBytes } }
 
@@ -100,6 +103,41 @@ struct DiskScanView: View {
         } message: {
             if let s = engine.completionSummary {
                 Text("Found \(s.itemCount) item\(s.itemCount == 1 ? "" : "s") totalling \(formatBytes(s.totalBytes)).\nScan finished in \(s.durationString).")
+            }
+        }
+        // Safety snapshot prompt — shown before the delete confirmation
+        .alert("Create a Safety Snapshot?", isPresented: $showSnapshotPrompt) {
+            Button("Create Snapshot & Continue") {
+                Task {
+                    await createLocalSnapshot()
+                    showConfirm = true
+                }
+            }
+            Button("Skip & Continue") {
+                showConfirm = true
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Before deleting, you can take a local Time Machine snapshot. This lets you recover any of these files later if needed. The snapshot is stored on your Mac and does not require a backup drive.")
+        }
+    }
+
+    // MARK: - Snapshot helper
+
+    /// Creates a local Time Machine snapshot via `tmutil localsnapshot`.
+    /// No admin privileges required. Runs synchronously on a background thread.
+    private func createLocalSnapshot() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/tmutil")
+                process.arguments = ["localsnapshot"]
+                // Suppress output — we don't need it and it avoids spurious Terminal windows
+                process.standardOutput = FileHandle.nullDevice
+                process.standardError  = FileHandle.nullDevice
+                try? process.run()
+                process.waitUntilExit()
+                continuation.resume()
             }
         }
     }
@@ -420,7 +458,7 @@ struct DiskScanView: View {
             }
 
             Button("Delete Selected") {
-                showConfirm = true
+                showSnapshotPrompt = true
             }
             .buttonStyle(.borderedProminent)
             .disabled(selectedItems.isEmpty)
