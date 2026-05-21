@@ -85,62 +85,112 @@ struct IdleView: View {
     @Binding var showAppPicker: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
 
-            // ── Direct uninstall ──────────────────────────────────────────
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Uninstall an App")
+                // ── Apps currently in Trash ───────────────────────────────
+                if !state.appsInTrash.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "trash.fill")
+                                .foregroundStyle(.orange)
+                            Text("Apps in Trash")
+                                .font(.headline)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityAddTraits(.isHeader)
+                        Text("These apps are in your Trash. Scan any of them to find and remove leftover files.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        ForEach(state.appsInTrash, id: \.trashURL) { app in
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(app.displayName)
+                                        .fontWeight(.medium)
+                                    if let id = app.bundleIdentifier {
+                                        Text(id)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Button("Scan for leftovers") {
+                                    state.scanExistingTrashedApp(app)
+                                }
+                                .controlSize(.small)
+                                .accessibilityLabel("Scan \(app.displayName) for leftover files")
+                            }
+                            .padding(.vertical, 4)
+                            .accessibilityElement(children: .combine)
+                        }
+                    }
+                    .padding(14)
+                    .background(Color.orange.opacity(0.08))
+                    .cornerRadius(10)
+                    .overlay(RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.orange.opacity(0.3), lineWidth: 1))
+
+                    Divider()
+                }
+
+                // ── Direct uninstall ──────────────────────────────────────
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Uninstall an App")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+                    Text("Select any installed application and ACleaner will move it to the Trash then scan for its leftover files — no dragging required.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Choose App to Uninstall\u{2026}") {
+                        showAppPicker = true
+                    }
+                    .controlSize(.large)
+                    .keyboardShortcut("u", modifiers: .command)
+                    .accessibilityHint("Opens a searchable list of installed apps. Press Enter on an app to move it to the Trash and scan for leftovers. Shortcut: Command-U.")
+                }
+                .padding(14)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color(nsColor: .separatorColor), lineWidth: 1))
+
+                Divider()
+
+                // ── Trash watcher status ──────────────────────────────────
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Trash Watcher")
+                        .font(.headline)
+                        .accessibilityAddTraits(.isHeader)
+                    Text(state.watchEnabled
+                         ? "Watching the Trash. When you move an app to the Trash, ACleaner will offer to remove its leftover files automatically."
+                         : "Watching is off. Turn on the Watch Trash switch to enable automatic detection.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                // ── Recent events ─────────────────────────────────────────
+                Text("Recent events")
                     .font(.headline)
                     .accessibilityAddTraits(.isHeader)
-                Text("Select any installed application and ACleaner will move it to the Trash then scan for its leftover files — no dragging required.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Button("Choose App to Uninstall\u{2026}") {
-                    showAppPicker = true
+                if state.recentEvents.isEmpty {
+                    Text("No applications detected yet.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    List(Array(state.recentEvents.enumerated()), id: \.offset) { _, event in
+                        Text(event)
+                    }
+                    .accessibilityLabel("Recent detection events")
+                    .frame(minHeight: 120)
                 }
-                .controlSize(.large)
-                .keyboardShortcut("u", modifiers: .command)
-                .accessibilityHint("Opens a searchable list of installed apps. Press Enter on an app to move it to the Trash and scan for leftovers. Shortcut: Command-U.")
+
+                Spacer(minLength: 0)
             }
-            .padding(14)
-            .background(Color(nsColor: .controlBackgroundColor))
-            .cornerRadius(10)
-            .overlay(RoundedRectangle(cornerRadius: 10)
-                .stroke(Color(nsColor: .separatorColor), lineWidth: 1))
-
-            Divider()
-
-            // ── Trash watcher status ──────────────────────────────────────
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Trash Watcher")
-                    .font(.headline)
-                    .accessibilityAddTraits(.isHeader)
-                Text(state.watchEnabled
-                     ? "Watching the Trash. When you move an app to the Trash, ACleaner will offer to remove its leftover files automatically."
-                     : "Watching is off. Turn on the Watch Trash switch to enable automatic detection.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            // ── Recent events ─────────────────────────────────────────────
-            Text("Recent events")
-                .font(.headline)
-                .accessibilityAddTraits(.isHeader)
-            if state.recentEvents.isEmpty {
-                Text("No applications detected yet.")
-                    .foregroundStyle(.secondary)
-            } else {
-                List(Array(state.recentEvents.enumerated()), id: \.offset) { _, event in
-                    Text(event)
-                }
-                .accessibilityLabel("Recent detection events")
-                .frame(minHeight: 120)
-            }
-
-            Spacer(minLength: 0)
         }
+        .onAppear { state.refreshTrashContents() }
     }
 }
 

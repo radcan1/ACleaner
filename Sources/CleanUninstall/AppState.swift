@@ -26,6 +26,8 @@ final class AppState: ObservableObject {
     @Published var recentEvents: [String] = []
     /// Non-nil when trashAndScan fails; MainView binds an alert to this.
     @Published var trashingError: String? = nil
+    /// Apps currently sitting in ~/.Trash — shown in the idle screen.
+    @Published var appsInTrash: [TrashedApp] = []
 
     private let watcher = TrashWatcher()
     private let scanner = LeftoverScanner()
@@ -107,6 +109,36 @@ final class AppState: ObservableObject {
     func resetToIdle() {
         phase = .idle
         selection = []
+        refreshTrashContents()
+    }
+
+    // MARK: - Existing-Trash support
+
+    /// Re-reads ~/.Trash and updates `appsInTrash`. Called on appear and after cleanup.
+    func refreshTrashContents() {
+        let trashDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".Trash").path
+        Task.detached(priority: .userInitiated) {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: trashDir)) ?? []
+            let apps: [TrashedApp] = names
+                .filter { $0.hasSuffix(".app") }
+                .compactMap { TrashedApp.from(trashURL: URL(fileURLWithPath: trashDir + "/" + $0)) }
+                .filter {
+                    let id = $0.bundleIdentifier ?? ""
+                    return id != "com.user.ACleaner" && id != "com.cleanuninstall.app"
+                }
+            await MainActor.run { self.appsInTrash = apps }
+        }
+    }
+
+    /// Transitions directly to the detected phase for an app that is already in the Trash.
+    func scanExistingTrashedApp(_ app: TrashedApp) {
+        seenPaths.insert(app.trashURL.path)      // prevent watcher double-firing
+        recentEvents.insert("Detected \(app.displayName) in Trash", at: 0)
+        if recentEvents.count > 20 { recentEvents.removeLast() }
+        phase = .detected(app)
+        SoundPlayer.playDetected()
+        announce("\(app.displayName) is in the Trash. Ready to scan for leftover files.")
     }
 
     // MARK: - Direct uninstall (user-initiated, no Trash drag needed)
