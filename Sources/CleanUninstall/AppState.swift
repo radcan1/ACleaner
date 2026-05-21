@@ -134,26 +134,51 @@ final class AppState: ObservableObject {
                 needsElevation = true
             }
 
-            // ── Step 2: Finder fallback (shows macOS password dialog) ────────
+            // ── Step 2: privileged mv via AppleScript (shows macOS password dialog,
+            //            requires no Automation / Finder permission) ─────────────
             if needsElevation {
-                let path   = appURL.path
-                // Raw-string literal keeps the double quotes literal inside AppleScript
-                let source = #"tell application "Finder" to move POSIX file "\#(path)" to trash"#
+                // Compute a unique destination name inside ~/.Trash (mirrors Finder).
+                let trashDir = FileManager.default
+                    .homeDirectoryForCurrentUser
+                    .appendingPathComponent(".Trash").path
+                let base     = appURL.deletingPathExtension().lastPathComponent
+                let ext      = appURL.pathExtension
+                var destName = appURL.lastPathComponent       // e.g. "GarageBand.app"
+                var destPath = (trashDir as NSString).appendingPathComponent(destName)
+                var counter  = 2
+                while FileManager.default.fileExists(atPath: destPath) {
+                    destName = ext.isEmpty
+                        ? "\(base) \(counter)"
+                        : "\(base) \(counter).\(ext)"
+                    destPath = (trashDir as NSString).appendingPathComponent(destName)
+                    counter += 1
+                }
 
-                let finderErrMsg: String? = await Task.detached(priority: .userInitiated) {
+                // Single-quote-escape a string for use inside a POSIX shell command.
+                func q(_ s: String) -> String {
+                    "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+                }
+                let shellCmd = "mv \(q(appURL.path)) \(q(destPath))"
+                // Embed in an AppleScript double-quoted string: escape \ then ".
+                let escaped  = shellCmd
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                let source   = "do shell script \"\(escaped)\" with administrator privileges"
+
+                let shellErrMsg: String? = await Task.detached(priority: .userInitiated) {
                     var dict: NSDictionary?
                     NSAppleScript(source: source)?.executeAndReturnError(&dict)
                     return dict?["NSAppleScriptErrorMessage"] as? String
                 }.value
 
-                if let errMsg = finderErrMsg {
+                if let shellErrMsg {
                     phase = .idle
-                    trashingError = "Could not move \"\(displayName)\" to the Trash.\n\n\(errMsg)"
+                    trashingError = "Could not move \"\(displayName)\" to the Trash.\n\n\(shellErrMsg)"
                     announce("Could not move \(displayName) to the Trash.")
                     return
                 }
-                // Finder succeeded but gives us no resulting URL — use findInTrash.
-                resultNSURL = nil
+                // We know the exact destination — skip findInTrash().
+                resultNSURL = NSURL(fileURLWithPath: destPath)
             }
 
             // ── Step 3: resolve the resulting Trash URL ──────────────────────

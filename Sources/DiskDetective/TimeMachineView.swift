@@ -19,9 +19,9 @@ class TimeMachineEngine: ObservableObject {
     @Published var statusMessage = ""
     @Published var feedbackMessage = ""
 
-    func loadSnapshots() async {
+    func loadSnapshots(clearFeedback: Bool = false) async {
         isLoading = true
-        feedbackMessage = ""
+        if clearFeedback { feedbackMessage = "" }
         statusMessage = "Loading snapshots…"
 
         let rawList = await shell("tmutil listlocalsnapshots / 2>/dev/null")
@@ -78,33 +78,61 @@ class TimeMachineEngine: ObservableObject {
         if success {
             let freed = toDelete.reduce(0) { $0 + $1.sizeBytes }
             let sizeStr = freed > 0 ? " · \(formatBytes(freed)) freed" : ""
-            feedbackMessage = "\(countStr) deleted\(sizeStr)."
-            await loadSnapshots()
+            let msg = "\(countStr) deleted\(sizeStr)."
+            feedbackMessage = msg
+            SoundPlayer.playCleanupComplete()
+            announce(msg)
+            await loadSnapshots()           // does NOT clear feedbackMessage
         } else if errMsg.contains("-128") || errMsg.contains("cancelled") {
             feedbackMessage = "Deletion cancelled."
+            announce("Deletion cancelled.")
         } else {
             feedbackMessage = "Error: \(errMsg)"
+            announce("Error deleting snapshots: \(errMsg)")
         }
 
         isDeleting = false
     }
 
     func deleteAll() async {
+        // Capture total size now — the list will be gone after deletion.
+        let totalBytes = snapshots.reduce(0) { $0 + $1.sizeBytes }
+        let totalCount = snapshots.count
+
         isDeleting = true
         feedbackMessage = "Deleting all snapshots…"
 
         let (success, errMsg) = await runPrivileged("tmutil deletelocalsnapshots /")
 
         if success {
-            feedbackMessage = "All local snapshots deleted."
-            await loadSnapshots()
+            let sizeStr = totalBytes > 0 ? " · \(formatBytes(totalBytes)) freed" : ""
+            let msg = "\(totalCount) snapshot\(totalCount == 1 ? "" : "s") deleted\(sizeStr)."
+            feedbackMessage = msg
+            SoundPlayer.playCleanupComplete()
+            announce(msg)
+            await loadSnapshots()           // does NOT clear feedbackMessage
         } else if errMsg.contains("-128") || errMsg.contains("cancelled") {
             feedbackMessage = "Deletion cancelled."
+            announce("Deletion cancelled.")
         } else {
             feedbackMessage = "Error: \(errMsg)"
+            announce("Error deleting snapshots: \(errMsg)")
         }
 
         isDeleting = false
+    }
+
+    // Posts a VoiceOver announcement so the result is spoken even when
+    // the feedback banner is off-screen or focus is elsewhere.
+    private func announce(_ message: String) {
+        NSAccessibility.post(
+            element: NSApp as Any,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: message,
+                .priority: NSAccessibilityPriorityLevel.high.rawValue
+            ]
+        )
     }
 
     // Runs a shell command via the macOS native admin-password dialog.
@@ -219,7 +247,7 @@ struct TimeMachineView: View {
             Divider()
             footerBar
         }
-        .task { await engine.loadSnapshots() }
+        .task { await engine.loadSnapshots(clearFeedback: true) }
         .alert("Delete All Snapshots?", isPresented: $showDeleteAllConfirm) {
             Button("Delete All", role: .destructive) {
                 Task { await engine.deleteAll() }
@@ -262,7 +290,7 @@ struct TimeMachineView: View {
             }
 
             Button {
-                Task { await engine.loadSnapshots() }
+                Task { await engine.loadSnapshots(clearFeedback: true) }
             } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }

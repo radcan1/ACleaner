@@ -42,7 +42,7 @@ struct FolderItem: Identifiable {
         }
     }
 
-    /// Full spoken label for VoiceOver — name, type, and size in one sentence.
+    /// Full spoken label for VoiceOver — name, type, and size.
     var accessibilityLabel: String { "\(name), \(typeLabel), \(sizeString)" }
 }
 
@@ -54,6 +54,8 @@ class FolderSizeEngine: ObservableObject {
     @Published var isScanning = false
     @Published var currentPath: String
     @Published var scanStatus = "Ready."
+    /// Incremented on every completed scan so the view can detect navigation.
+    @Published var scanVersion: Int = 0
 
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
 
@@ -63,7 +65,6 @@ class FolderSizeEngine: ObservableObject {
 
     // MARK: Breadcrumbs
 
-    /// Path components from the filesystem root down to currentPath.
     var breadcrumbs: [(name: String, path: String)] {
         var result: [(String, String)] = []
         var url = URL(fileURLWithPath: currentPath)
@@ -117,7 +118,9 @@ class FolderSizeEngine: ObservableObject {
 
         items      = result.sorted { $0.sizeBytes > $1.sizeBytes }
         isScanning = false
-        let total  = items.reduce(0) { $0 + $1.sizeBytes }
+        scanVersion += 1
+
+        let total = items.reduce(0) { $0 + $1.sizeBytes }
         scanStatus = items.isEmpty
             ? "This folder is empty."
             : "\(items.count) item\(items.count == 1 ? "" : "s") \u{2014} \(formatBytes(total))"
@@ -198,6 +201,14 @@ struct FolderSizeView: View {
     @State private var itemToTrash: FolderItem? = nil
     @State private var showFolderPicker = false
 
+    // Tracks which row VoiceOver should focus after navigation.
+    // Using an enum lets us distinguish "parent" from any item row.
+    private enum RowID: Hashable {
+        case parent
+        case item(UUID)
+    }
+    @AccessibilityFocusState private var focusedRow: RowID?
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -209,6 +220,19 @@ struct FolderSizeView: View {
             footer
         }
         .task { await engine.scan() }
+        // After every navigation (scanVersion > 1), move VoiceOver focus to
+        // the top of the refreshed list so the user doesn't have to hunt for it.
+        .onChange(of: engine.scanVersion) { version in
+            guard version > 1 else { return }   // skip the initial load
+            // Brief delay lets SwiftUI finish rebuilding list cells.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                if engine.canGoUp {
+                    focusedRow = .parent
+                } else if let first = engine.items.first {
+                    focusedRow = .item(first.id)
+                }
+            }
+        }
         .alert("Move to Trash?", isPresented: $showTrashConfirm, presenting: itemToTrash) { item in
             Button("Move to Trash", role: .destructive) {
                 Task { await engine.moveToTrash(item) }
@@ -268,10 +292,6 @@ struct FolderSizeView: View {
     }
 
     // MARK: Breadcrumb bar
-    //
-    // Each crumb is an interactive button with a clear label. VoiceOver navigates
-    // them with VO+arrows; pressing Enter activates (navigates up to that folder).
-    // The whole bar also reads as a single "current location" announcement if needed.
 
     private var breadcrumbBar: some View {
         let crumbs = engine.breadcrumbs
@@ -338,12 +358,9 @@ struct FolderSizeView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
         } else {
-            // ── File browser list ──────────────────────────────────────────────
-            // Wrapped in a rounded-rect container so VoiceOver users and
-            // sighted users can clearly see where the browsable area is.
             List {
                 if engine.canGoUp {
-                    // "Parent Folder" row — navigates up one level
+                    // "Parent Folder" row — real Button so Enter activates it.
                     Button {
                         Task { await engine.navigateUp() }
                     } label: {
@@ -357,14 +374,12 @@ struct FolderSizeView: View {
                         }
                         .padding(.vertical, 2)
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.plain)
                     .disabled(engine.isScanning)
-                    .accessibilityLabel("Go up to parent folder")
-                    .accessibilityHint("Press Enter to navigate up. Shortcut: Command-[")
-                    // Default action so Enter works in VoiceOver
-                    .accessibilityAction {
-                        Task { await engine.navigateUp() }
-                    }
+                    .accessibilityLabel("Parent folder")
+                    .accessibilityHint("Opens the parent folder. Shortcut: Command-[")
+                    // Bind VoiceOver focus so we can return here after navigation.
+                    .accessibilityFocused($focusedRow, equals: .parent)
                 }
 
                 ForEach(engine.items) { item in
@@ -375,18 +390,19 @@ struct FolderSizeView: View {
                         onReveal: { engine.revealInFinder(item) },
                         onTrash:  { itemToTrash = item; showTrashConfirm = true }
                     )
+                    // Bind each row to focusedRow so we can restore focus here
+                    // after navigation without the user having to hunt for the list.
+                    .accessibilityFocused($focusedRow, equals: .item(item.id))
                 }
             }
             .listStyle(.inset(alternatesRowBackgrounds: true))
-            // Visible border that clearly frames the browsable area
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
             )
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            // Announce the list to VoiceOver as a named region
-            .accessibilityLabel("File browser. \(engine.items.count) item\(engine.items.count == 1 ? "" : "s"). Press Enter on a folder to open it.")
+            .accessibilityLabel("File browser. \(engine.items.count) item\(engine.items.count == 1 ? "" : "s").")
         }
     }
 
@@ -396,10 +412,10 @@ struct FolderSizeView: View {
         HStack(spacing: 12) {
             Text(engine.isScanning
                     ? engine.scanStatus
-                    : "Press Enter on a folder to open it. Items sorted largest first.")
+                    : "Items sorted largest first. Press Enter on a folder to open it.")
                 .font(.callout)
                 .foregroundColor(.secondary)
-                .accessibilityHidden(true)   // status text in header covers this
+                .accessibilityHidden(true)
 
             Spacer()
 
@@ -422,6 +438,11 @@ struct FolderSizeView: View {
 }
 
 // MARK: - Row
+//
+// Using a real Button (not a plain HStack with accessibilityAction) is what
+// makes the Enter key work in VoiceOver on macOS. The .isButton trait +
+// unnamed accessibilityAction only responds to VO+Space, not Enter.
+// A Button responds to Enter natively.
 
 struct FolderItemRow: View {
     let item: FolderItem
@@ -431,42 +452,48 @@ struct FolderItemRow: View {
     let onTrash: () -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: item.icon)
-                .foregroundColor(item.isDirectory ? .accentColor : .secondary)
-                .frame(width: 22)
-                .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.name)
-                    .fontWeight(.medium)
-                    .lineLimit(1)
-                Text(item.typeLabel.capitalized)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-
-            Spacer()
-
-            Text(item.sizeString)
-                .fontWeight(.semibold)
-                .monospacedDigit()
-                .foregroundColor(
-                    item.sizeBytes > 1_000_000_000 ? .red :
-                    item.sizeBytes >   500_000_000 ? .orange : .primary
-                )
-                .frame(minWidth: 70, alignment: .trailing)
-
-            if item.isDirectory {
-                Image(systemName: "chevron.right")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+        Button {
+            // Primary action: open folder, or reveal file in Finder.
+            if item.isDirectory { onOpen() } else { onReveal() }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: item.icon)
+                    .foregroundColor(item.isDirectory ? .accentColor : .secondary)
+                    .frame(width: 22)
                     .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(item.name)
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                    Text(item.typeLabel.capitalized)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                Text(item.sizeString)
+                    .fontWeight(.semibold)
+                    .monospacedDigit()
+                    .foregroundColor(
+                        item.sizeBytes > 1_000_000_000 ? .red :
+                        item.sizeBytes >   500_000_000 ? .orange : .primary
+                    )
+                    .frame(minWidth: 70, alignment: .trailing)
+
+                if item.isDirectory {
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .accessibilityHidden(true)
+                }
             }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
-        .onTapGesture { if item.isDirectory { onOpen() } }
+        .buttonStyle(.plain)
+        .disabled(isScanning)
         .contextMenu {
             if item.isDirectory {
                 Button { onOpen() } label: {
@@ -481,21 +508,12 @@ struct FolderItemRow: View {
                 Label("Move to Trash", systemImage: "trash")
             }
         }
-        // ── VoiceOver ────────────────────────────────────────────────────────
-        // Combine into one element so VoiceOver reads name + type + size together.
-        .accessibilityElement(children: .ignore)
+        // Single combined accessibility label read by VoiceOver.
         .accessibilityLabel(item.accessibilityLabel)
-        // isButton trait tells VoiceOver "press Enter to activate"
-        .accessibilityAddTraits(.isButton)
         .accessibilityHint(item.isDirectory
-            ? "Press Enter to open. Use the VoiceOver rotor for more actions."
-            : "Use the VoiceOver rotor to reveal in Finder or move to Trash.")
-        // Default action — triggered by Enter key in VoiceOver.
-        // No `named:` parameter = this IS the Enter key action.
-        .accessibilityAction {
-            if item.isDirectory { onOpen() } else { onReveal() }
-        }
-        // Named rotor actions
+            ? "Opens folder. Use VoiceOver rotor for Reveal in Finder or Move to Trash."
+            : "Reveals in Finder. Use VoiceOver rotor for Move to Trash.")
+        // Named rotor actions — accessible via VO+Command+J
         .accessibilityAction(named: "Reveal in Finder") { onReveal() }
         .accessibilityAction(named: "Move to Trash")    { onTrash()  }
     }
