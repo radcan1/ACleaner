@@ -59,7 +59,13 @@ struct RootView: View {
         }
         .accessibilityLabel("ACleaner")
         .onAppear { checkPermissionsIfNeeded() }
-        .sheet(isPresented: $showPermissions) {
+        .sheet(isPresented: $showPermissions, onDismiss: {
+            // Mark acknowledged whenever the sheet is dismissed — whether the user
+            // clicked Continue, pressed Escape, or clicked outside the sheet.
+            // Without this, dismissing via Escape left hasBeenAcknowledged = false
+            // and the sheet re-appeared on every launch.
+            PermissionsChecker.hasBeenAcknowledged = true
+        }) {
             PermissionsView {
                 showPermissions = false
             }
