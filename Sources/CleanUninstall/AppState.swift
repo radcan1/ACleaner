@@ -16,7 +16,7 @@ final class AppState: ObservableObject {
         case scanning(TrashedApp)
         case results(TrashedApp, [LeftoverFile])
         case cleaning
-        case done(removed: Int, failed: [String])
+        case done(app: TrashedApp, removed: Int, failed: [String])
     }
 
     @Published var phase: Phase = .idle
@@ -95,7 +95,7 @@ final class AppState: ObservableObject {
         Task.detached(priority: .userInitiated) {
             let outcome = Cleaner.moveToTrash(urls: toRemove)
             await MainActor.run {
-                self.phase = .done(removed: outcome.removed, failed: outcome.failed)
+                self.phase = .done(app: trashed, removed: outcome.removed, failed: outcome.failed)
                 self.selection = []
                 SoundPlayer.playCleanupComplete()
                 let failedNote = outcome.failed.isEmpty

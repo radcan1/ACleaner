@@ -72,8 +72,8 @@ struct MainView: View {
             ResultsView(app: app, files: files)
         case .cleaning:
             ProgressMessageView(message: "Moving items to the Trash. Please wait.")
-        case .done(let removed, let failed):
-            DoneView(removed: removed, failed: failed)
+        case .done(let app, let removed, let failed):
+            DoneView(app: app, removed: removed, failed: failed)
         }
     }
 }
@@ -352,12 +352,15 @@ struct ResultsView: View {
 // MARK: - Done
 
 struct DoneView: View {
+    let app: TrashedApp
     let removed: Int
     let failed: [String]
     @EnvironmentObject var state: AppState
+    @State private var copied = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 14) {
+
             Text("Cleanup finished")
                 .font(.title3)
                 .accessibilityAddTraits(.isHeader)
@@ -365,14 +368,57 @@ struct DoneView: View {
             Text("Moved \(removed) item\(removed == 1 ? "" : "s") to the Trash.")
 
             if !failed.isEmpty {
-                Text("Items that could not be removed:")
-                    .font(.headline)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("\(failed.count) item\(failed.count == 1 ? "" : "s") could not be deleted")
+                            .font(.headline)
+                    }
+                    .accessibilityElement(children: .combine)
                     .accessibilityAddTraits(.isHeader)
-                List(Array(failed.enumerated()), id: \.offset) { _, line in
-                    Text(line)
+
+                    // Scrollable failure list
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(Array(failed.enumerated()), id: \.offset) { _, entry in
+                                Text(entry)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.primary)
+                                    .textSelection(.enabled)   // user can select & copy individual lines
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(8)
+                                    .background(Color(nsColor: .textBackgroundColor))
+                                    .cornerRadius(6)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .frame(minHeight: 80, maxHeight: 220)
+                    .overlay(RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1))
+                    .accessibilityLabel("Failed items. \(failed.count) item\(failed.count == 1 ? "" : "s") listed.")
+
+                    // Copy report button
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(failureReport, forType: .string)
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                    } label: {
+                        Label(copied ? "Copied!" : "Copy Failure Report",
+                              systemImage: copied ? "checkmark" : "doc.on.clipboard")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel(copied
+                        ? "Report copied to clipboard"
+                        : "Copy failure report to clipboard so you can share it for troubleshooting")
                 }
-                .accessibilityLabel("List of items that could not be removed.")
-                .frame(minHeight: 120)
+                .padding(12)
+                .background(Color.orange.opacity(0.07))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.orange.opacity(0.25), lineWidth: 1))
             }
 
             Button("Done") { state.resetToIdle() }
@@ -380,5 +426,24 @@ struct DoneView: View {
                 .accessibilityHint("Returns to the idle screen.")
             Spacer(minLength: 0)
         }
+    }
+
+    // Formatted plain-text report ready to paste into a conversation.
+    private var failureReport: String {
+        let dateStr = DateFormatter.localizedString(
+            from: Date(), dateStyle: .medium, timeStyle: .short)
+        var lines: [String] = []
+        lines.append("ACleaner — Cleanup Failure Report")
+        lines.append("Generated: \(dateStr)")
+        lines.append("App: \(app.displayName)")
+        if let id = app.bundleIdentifier { lines.append("Bundle ID: \(id)") }
+        lines.append("Removed successfully: \(removed) file\(removed == 1 ? "" : "s")")
+        lines.append("Could not delete: \(failed.count) file\(failed.count == 1 ? "" : "s")")
+        lines.append(String(repeating: "─", count: 50))
+        for entry in failed {
+            lines.append(entry)
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
     }
 }

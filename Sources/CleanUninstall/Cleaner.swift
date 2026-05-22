@@ -18,7 +18,8 @@ enum Cleaner {
                 try manager.trashItem(at: url, resultingItemURL: &resultURL)
                 removed += 1
             } catch {
-                failed.append("\(url.lastPathComponent): \(error.localizedDescription)")
+                // Include the full path so failure reports are actionable.
+                failed.append("\(url.path)\n   Error: \(error.localizedDescription)")
             }
         }
 
