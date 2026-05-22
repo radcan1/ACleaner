@@ -1,116 +1,177 @@
 import Foundation
+import CoreServices
 
-/// Watches ~/.Trash for newly added .app bundles.
+/// Watches ~/.Trash for newly-trashed .app bundles.
 ///
 /// Two complementary mechanisms run in parallel:
-///   1. kqueue DispatchSource — fires a .write event whenever the directory
-///      changes (O_EVTONLY, no data access, no FDA required).
-///   2. Polling timer — scans every 3 seconds as a belt-and-suspenders backup
-///      in case the kqueue event misfires (e.g. when the app wakes from sleep).
 ///
-/// Both share the same knownPaths set and serial queue, so there are no races.
-/// On start(), knownPaths is seeded with whatever is already in the Trash so
-/// pre-existing items are never reported.
+/// 1. FSEvents with kFSEventStreamCreateFlagFileEvents (primary) — copied from
+///    Pearcleaner's open-source sentinel implementation. With FileEvents, every
+///    changed item gets its own event whose `path` IS the item itself.  When
+///    WhatsApp.app lands in ~/.Trash, the event path is ~/.Trash/WhatsApp.app
+///    and pathExtension == "app" works directly — no directory scanning needed.
+///
+/// 2. Polling every 5 seconds (fallback) — catches cases where FSEvents misses
+///    an event (e.g. system wake, heavy I/O load). Uses its own `polledPaths`
+///    set to avoid re-reporting pre-existing items.
+///
+/// AppState.seenPaths provides final deduplication so the UI never double-fires
+/// even if both mechanisms fire for the same app.
 final class TrashWatcher: @unchecked Sendable {
     var onAppTrashed: (@Sendable (TrashedApp) -> Void)?
 
-    private var watchSource: DispatchSourceFileSystemObject?
-    private var pollTimer:   DispatchSourceTimer?
+    private var streamRef: FSEventStreamRef?
+    private var pollTimer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.user.acleaner.trashwatcher", qos: .utility)
-    private var knownPaths: Set<String> = []
-    private var dirFD: Int32 = -1
+
+    /// Used only by the poll timer. Seeded at start() so pre-existing Trash
+    /// items are not re-reported. FSEvents doesn't need this — it uses
+    /// kFSEventStreamEventIdSinceNow which naturally skips historical events.
+    private var polledPaths: Set<String> = []
 
     private var trashPath: String {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".Trash").path
     }
 
+    // MARK: - Stored C callbacks (must be non-capturing so they can be @convention(c))
+    // Pearcleaner stores them the same way.
+
+    let eventCallback: FSEventStreamCallback = { _, contextInfo, _, eventPaths, _, _ in
+        guard let contextInfo else { return }
+        let watcher = Unmanaged<TrashWatcher>.fromOpaque(contextInfo).takeUnretainedValue()
+        let paths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue() as! [String]
+        for path in paths { watcher.checkPath(path) }
+    }
+
+    let retainCallback: CFAllocatorRetainCallBack = { info in
+        guard let info else { return nil }
+        _ = Unmanaged<TrashWatcher>.fromOpaque(info).retain()
+        return info
+    }
+
+    let releaseCallback: CFAllocatorReleaseCallBack = { info in
+        guard let info else { return }
+        Unmanaged<TrashWatcher>.fromOpaque(info).release()
+    }
+
     // MARK: - Public API
 
     func start() {
-        guard watchSource == nil else { return }
+        guard streamRef == nil else { return }
 
-        // Seed so anything already in the Trash is never reported.
-        let existing = (try? FileManager.default.contentsOfDirectory(atPath: trashPath)) ?? []
-        knownPaths = Set(existing.map { trashPath + "/" + $0 })
+        // Seed polledPaths so the 5-second timer doesn't fire for items already
+        // in the Trash before this session started.  (Those are surfaced by the
+        // "Apps in Trash" list in IdleView instead.)
+        let trashDir = trashPath
+        let existing = (try? FileManager.default.contentsOfDirectory(atPath: trashDir)) ?? []
+        polledPaths = Set(existing.map { trashDir + "/" + $0 })
 
-        startKqueue()
+        startFSEvents()
         startPolling()
     }
 
     func stop() {
-        watchSource?.cancel()
-        watchSource = nil
+        if let s = streamRef {
+            FSEventStreamStop(s)
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+            streamRef = nil
+        }
         pollTimer?.cancel()
         pollTimer = nil
     }
 
     deinit { stop() }
 
-    // MARK: - kqueue watcher
+    // MARK: - FSEvents (Pearcleaner's proven approach)
 
-    private func startKqueue() {
-        let fd = open(trashPath, O_EVTONLY)
-        guard fd >= 0 else { return }
-        dirFD = fd
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: .write,      // fires whenever an item is added or removed
-            queue: queue
+    private func startFSEvents() {
+        let trashDir = trashPath
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: retainCallback,
+            release: releaseCallback,
+            copyDescription: nil
         )
+        guard let stream = FSEventStreamCreate(
+            kCFAllocatorDefault,
+            eventCallback,
+            &context,
+            [trashDir] as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            0,      // latency 0 — deliver immediately (same as Pearcleaner)
+            UInt32(kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents)
+        ) else { return }
 
-        source.setEventHandler { [weak self] in
-            // Small settle delay so the bundle is fully present when we scan.
-            self?.queue.asyncAfter(deadline: .now() + 0.5) {
-                self?.scanForNewApps()
-            }
-        }
-
-        source.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.dirFD >= 0 { close(self.dirFD); self.dirFD = -1 }
-        }
-
-        source.resume()
-        watchSource = source
+        FSEventStreamSetDispatchQueue(stream, queue)
+        FSEventStreamStart(stream)
+        streamRef = stream
     }
 
     // MARK: - Polling fallback
 
     private func startPolling() {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        // Poll every 3 seconds; the first fire happens after 3 s so the initial
-        // seed has time to complete before we start comparing.
-        timer.schedule(deadline: .now() + 3, repeating: 3)
-        timer.setEventHandler { [weak self] in
-            self?.scanForNewApps()
-        }
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in self?.pollScan() }
         timer.resume()
         pollTimer = timer
     }
 
-    // MARK: - Scan
-
-    /// Compares the current Trash contents with knownPaths and reports new apps.
-    /// Called on the serial queue by both the kqueue handler and the poll timer.
-    private func scanForNewApps() {
-        let entries = (try? FileManager.default.contentsOfDirectory(atPath: trashPath)) ?? []
+    private func pollScan() {
+        let trashDir = trashPath
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: trashDir)) ?? []
         for name in entries where name.hasSuffix(".app") {
-            let path = trashPath + "/" + name
-            guard !knownPaths.contains(path) else { continue }
-            knownPaths.insert(path)
+            let path = trashDir + "/" + name
+            guard !polledPaths.contains(path) else { continue }
+            polledPaths.insert(path)
+            checkPath(path)
+        }
+    }
 
-            let url = URL(fileURLWithPath: path)
-            guard let trashed = TrashedApp.from(trashURL: url) else { continue }
+    // MARK: - Detection (shared by FSEvents and polling)
 
-            // Never fire for ACleaner itself.
-            let bundleID = trashed.bundleIdentifier ?? ""
-            guard bundleID != "com.user.ACleaner",
-                  bundleID != "com.cleanuninstall.app" else { continue }
+    private func checkPath(_ path: String) {
+        let url = URL(fileURLWithPath: path)
 
-            let cb = onAppTrashed
-            DispatchQueue.main.async { cb?(trashed) }
+        // Only .app bundles
+        guard url.pathExtension == "app" else { return }
+
+        // Confirm it's genuinely inside the Trash — guards against edge cases
+        // where the path looks like a Trash item but was renamed back out.
+        // Same check Pearcleaner uses.
+        guard FileManager.default.isInTrash(url) else { return }
+
+        // Must be a valid, readable app bundle
+        guard let trashed = TrashedApp.from(trashURL: url) else { return }
+
+        // Never report ACleaner itself
+        let bundleID = trashed.bundleIdentifier ?? ""
+        guard bundleID != "com.user.ACleaner",
+              bundleID != "com.cleanuninstall.app" else { return }
+
+        let cb = onAppTrashed
+        DispatchQueue.main.async { cb?(trashed) }
+    }
+}
+
+// MARK: - FileManager + Trash relationship
+// Copied from Pearcleaner — uses getRelationship(_:of:in:toItemAt:) which is
+// the correct API for checking whether a URL is inside the user's Trash.
+
+extension FileManager {
+    func isInTrash(_ url: URL) -> Bool {
+        var relationship: URLRelationship = .other
+        do {
+            try getRelationship(&relationship,
+                                of: .trashDirectory,
+                                in: .userDomainMask,
+                                toItemAt: url)
+            return relationship == .contains
+        } catch {
+            return false
         }
     }
 }
