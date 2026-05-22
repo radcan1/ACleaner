@@ -392,6 +392,62 @@ class ScanEngine: ObservableObject {
              "\(home)/.gradle/caches",
              .deleteDirectory),
 
+            // ── Additional package manager caches ─────────────────────────
+
+            ("Dev Caches",
+             "Cargo Registry (Rust)",
+             "Rust crate source downloads cached by Cargo — can grow to several GB, safe to delete, Cargo re-downloads on next build",
+             "\(home)/.cargo/registry",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "Cargo Git Checkouts (Rust)",
+             "Rust git-sourced crate checkouts cached by Cargo — safe to delete",
+             "\(home)/.cargo/git",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "Go Module Cache",
+             "Go module source downloads cached by the Go toolchain — safe to delete, Go re-downloads on next build",
+             "\(home)/go/pkg/mod",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "Maven Local Repository",
+             "Java/Kotlin dependencies cached locally by Maven — safe to delete, Maven re-downloads on next build",
+             "\(home)/.m2/repository",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "Dart / Flutter Pub Cache",
+             "Dart and Flutter package downloads cached by pub — safe to delete, pub re-downloads on next flutter pub get",
+             "\(home)/.pub-cache",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "Ruby Gems",
+             "Globally installed Ruby gems — safe to delete, reinstall with: gem install",
+             "\(home)/.gem",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "NuGet Packages (.NET)",
+             ".NET NuGet package cache — safe to delete, NuGet re-downloads on next build",
+             "\(home)/.nuget/packages",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "Swift Package Manager Cache",
+             "Swift PM downloaded source packages — safe to delete, SPM re-fetches on next build",
+             "\(home)/.swiftpm",
+             .deleteDirectory),
+
+            ("Dev Caches",
+             "Composer Cache (PHP)",
+             "PHP Composer package download cache — safe to delete",
+             "\(home)/.composer/cache",
+             .deleteDirectory),
+
             // ── Xcode: Simulator runtimes ─────────────────────────────────
 
             ("Xcode",
@@ -651,13 +707,53 @@ class ScanEngine: ObservableObject {
             done | head -40
         """)
 
+        // Flutter build/ — has pubspec.yaml in parent
+        let flutterBuildOut = await shell("""
+            find "\(home)" -maxdepth 8 -name build -type d \
+              -not -path '*/\\.*' 2>/dev/null | \
+            while read -r d; do
+                parent=$(dirname "$d")
+                if [ -f "$parent/pubspec.yaml" ]; then
+                    echo "$d"
+                fi
+            done | head -40
+        """)
+
+        // .next/ — Next.js (has next.config.js or package.json with "next" in parent)
+        let nextOut = await shell("""
+            find "\(home)" -maxdepth 8 -name .next -type d \
+              -not -path '*/\\.*' 2>/dev/null | \
+            while read -r d; do
+                parent=$(dirname "$d")
+                if [ -f "$parent/next.config.js" ] || [ -f "$parent/next.config.ts" ] || \
+                   ([ -f "$parent/package.json" ] && grep -q '"next"' "$parent/package.json" 2>/dev/null); then
+                    echo "$d"
+                fi
+            done | head -40
+        """)
+
+        // .nuxt/ — Nuxt.js
+        let nuxtOut = await shell("""
+            find "\(home)" -maxdepth 8 -name .nuxt -type d \
+              -not -path '*/\\.*' 2>/dev/null | \
+            while read -r d; do
+                parent=$(dirname "$d")
+                if [ -f "$parent/nuxt.config.js" ] || [ -f "$parent/nuxt.config.ts" ]; then
+                    echo "$d"
+                fi
+            done | head -40
+        """)
+
         var result: [ScanItem] = []
         let fm = FileManager.default
         let df = DateFormatter(); df.dateFormat = "d MMM yyyy"
 
         for (paths, label, tip) in [
-            (targetOut,     "build output",  "Recreate with: cargo build / mvn package"),
-            (swiftBuildOut, "Swift PM build", "Recreate with: swift build"),
+            (targetOut,      "build output",       "Recreate with: cargo build / mvn package"),
+            (swiftBuildOut,  "Swift PM build",      "Recreate with: swift build"),
+            (flutterBuildOut,"Flutter build",       "Recreate with: flutter build"),
+            (nextOut,        "Next.js build cache", "Recreate with: next build"),
+            (nuxtOut,        "Nuxt.js build cache", "Recreate with: nuxt build"),
         ] {
             for path in paths.split(separator: "\n").map(String.init).filter({ !$0.isEmpty }) {
                 let size = await dirSize(path)
