@@ -1,18 +1,18 @@
 import Foundation
 import AppKit
 
-/// Checks for and directs the user to grant macOS privacy permissions
-/// that ACleaner needs to run without per-folder prompts.
+/// Checks for Full Disk Access using Pearcleaner's proven approach:
+/// POSIX access() syscall + contentsOfDirectory fallback on three paths
+/// that are always present but gated behind FDA. Never triggers a TCC prompt.
 ///
-/// FDA detection mirrors Pearcleaner's approach: POSIX access() syscall +
-/// contentsOfDirectory on three paths that are always present but gated
-/// behind Full Disk Access. This never triggers a TCC prompt.
+/// There is no "acknowledged" flag. FDA is checked fresh on every launch.
+/// If it is missing, RootView shows a non-blocking banner — the same
+/// philosophy Pearcleaner uses (no modal, no gate, just an indicator).
 enum PermissionsChecker {
 
     // MARK: - Full Disk Access
 
     /// Returns true if Full Disk Access has been granted.
-    /// Checks three paths known to require FDA on every Mac.
     static var hasFullDiskAccess: Bool {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let checkPaths = [
@@ -21,11 +21,9 @@ enum PermissionsChecker {
             home + "/Library/Mail",
         ]
         for path in checkPaths {
-            // Fast POSIX syscall — no TCC prompt, no sandbox side-effects
             if let cPath = path.cString(using: .utf8), access(cPath, R_OK) == 0 {
                 return true
             }
-            // Fallback: directory listing via FileManager
             if (try? FileManager.default.contentsOfDirectory(atPath: path)) != nil {
                 return true
             }
@@ -41,9 +39,9 @@ enum PermissionsChecker {
 
     // MARK: - Async check with retry
 
-    /// Runs the FDA check on a background thread.
-    /// Makes up to 2 attempts with a 100 ms gap — identical to Pearcleaner's pattern.
-    /// Calls `completion` on the main thread once a definitive answer is available.
+    /// Runs the FDA check on a background thread with up to 2 attempts
+    /// and a 100 ms gap between them — same as Pearcleaner's pattern.
+    /// Calls completion on the main thread.
     static func checkAsync(completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             for attempt in 1...2 {
@@ -57,16 +55,7 @@ enum PermissionsChecker {
         }
     }
 
-    // MARK: - Acknowledgment persistence
-
-    /// True once the user has clicked Continue in the permissions sheet.
-    /// Stored in UserDefaults so the first-launch sheet is not shown again.
-    static var hasBeenAcknowledged: Bool {
-        get { UserDefaults.standard.bool(forKey: "acleanerPermissionsAcknowledged") }
-        set { UserDefaults.standard.set(newValue, forKey: "acleanerPermissionsAcknowledged") }
-    }
-
-    // MARK: - Overall readiness
+    // MARK: - Convenience
 
     static var allGranted: Bool { hasFullDiskAccess }
 }

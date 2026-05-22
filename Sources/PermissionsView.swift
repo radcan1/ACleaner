@@ -61,8 +61,7 @@ struct PermissionsView: View {
 
                 Spacer()
 
-                Button(fdaGranted ? "Continue" : "Continue Without Full Access") {
-                    PermissionsChecker.hasBeenAcknowledged = true
+                Button(fdaGranted ? "Done" : "Close") {
                     onContinue()
                 }
                 .buttonStyle(.borderedProminent)
