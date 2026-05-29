@@ -59,6 +59,10 @@ swiftc \
   "$SCRIPT_DIR/Sources/CleanUninstall/TrashWatcher.swift" \
   "$SCRIPT_DIR/Sources/CleanUninstall/MainView.swift" \
   "$SCRIPT_DIR/Sources/CleanUninstall/SettingsView.swift" \
+  \
+  "$SCRIPT_DIR/Sources/StartupManager/StartupItem.swift" \
+  "$SCRIPT_DIR/Sources/StartupManager/StartupScanner.swift" \
+  "$SCRIPT_DIR/Sources/StartupManager/StartupManagerView.swift" \
   -o "$BINARY_DIR/$APP_NAME"
 
 # Info.plist

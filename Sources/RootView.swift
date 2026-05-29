@@ -1,9 +1,10 @@
 import SwiftUI
 
 enum ACleanerTool: String, CaseIterable, Identifiable {
-    case updater       = "Updater"
-    case diskDetective = "Disk Detective"
+    case updater        = "Updater"
+    case diskDetective  = "Disk Detective"
     case cleanUninstall = "Clean Uninstall"
+    case startupManager = "Startup Manager"
 
     var id: String { rawValue }
 
@@ -12,6 +13,7 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
         case .updater:        return "arrow.down.circle"
         case .diskDetective:  return "internaldrive"
         case .cleanUninstall: return "trash.slash"
+        case .startupManager: return "power"
         }
     }
 }
@@ -60,6 +62,9 @@ struct RootView: View {
                 case .cleanUninstall:
                     MainView()
                         .environmentObject(cleanState)
+                        .frame(minWidth: 640, minHeight: 480)
+                case .startupManager:
+                    StartupManagerView()
                         .frame(minWidth: 640, minHeight: 480)
                 case nil:
                     Text("Select a tool from the sidebar.")
