@@ -63,6 +63,10 @@ swiftc \
   "$SCRIPT_DIR/Sources/StartupManager/StartupItem.swift" \
   "$SCRIPT_DIR/Sources/StartupManager/StartupScanner.swift" \
   "$SCRIPT_DIR/Sources/StartupManager/StartupManagerView.swift" \
+  \
+  "$SCRIPT_DIR/Sources/LLMScanner/LLMModel.swift" \
+  "$SCRIPT_DIR/Sources/LLMScanner/LLMScanner.swift" \
+  "$SCRIPT_DIR/Sources/LLMScanner/LLMScannerView.swift" \
   -o "$BINARY_DIR/$APP_NAME"
 
 # Info.plist

@@ -5,6 +5,7 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
     case diskDetective  = "Disk Detective"
     case cleanUninstall = "Clean Uninstall"
     case startupManager = "Startup Manager"
+    case llmScanner     = "LLM Scanner"
 
     var id: String { rawValue }
 
@@ -14,6 +15,7 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
         case .diskDetective:  return "internaldrive"
         case .cleanUninstall: return "trash.slash"
         case .startupManager: return "power"
+        case .llmScanner:     return "cpu"
         }
     }
 }
@@ -65,6 +67,9 @@ struct RootView: View {
                         .frame(minWidth: 640, minHeight: 480)
                 case .startupManager:
                     StartupManagerView()
+                        .frame(minWidth: 640, minHeight: 480)
+                case .llmScanner:
+                    LLMScannerView()
                         .frame(minWidth: 640, minHeight: 480)
                 case nil:
                     Text("Select a tool from the sidebar.")
