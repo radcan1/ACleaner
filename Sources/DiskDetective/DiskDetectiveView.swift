@@ -7,6 +7,7 @@ enum DiskTab: String, CaseIterable {
     case appCleaner  = "App Cleaner"
     case orphans     = "Orphans"
     case history     = "History"
+    case claude      = "Claude"
 
     var icon: String {
         switch self {
@@ -16,6 +17,7 @@ enum DiskTab: String, CaseIterable {
         case .appCleaner:  return "app.badge.minus"
         case .orphans:     return "questionmark.folder"
         case .history:     return "chart.xyaxis.line"
+        case .claude:      return "bubbles.and.sparkles"
         }
     }
 }
@@ -72,6 +74,11 @@ struct DiskDetectiveView: View {
                     .opacity(selectedTab == .history ? 1 : 0)
                     .allowsHitTesting(selectedTab == .history)
                     .accessibilityHidden(selectedTab != .history)
+
+                ClaudeCleanupView()
+                    .opacity(selectedTab == .claude ? 1 : 0)
+                    .allowsHitTesting(selectedTab == .claude)
+                    .accessibilityHidden(selectedTab != .claude)
             }
         }
     }

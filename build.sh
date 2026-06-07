@@ -67,6 +67,12 @@ swiftc \
   "$SCRIPT_DIR/Sources/LLMScanner/LLMModel.swift" \
   "$SCRIPT_DIR/Sources/LLMScanner/LLMScanner.swift" \
   "$SCRIPT_DIR/Sources/LLMScanner/LLMScannerView.swift" \
+  \
+  "$SCRIPT_DIR/Sources/ClaudeCleanup/ClaudeCleanupItem.swift" \
+  "$SCRIPT_DIR/Sources/ClaudeCleanup/ClaudeCleanupScanner.swift" \
+  "$SCRIPT_DIR/Sources/ClaudeCleanup/ClaudeSkillItem.swift" \
+  "$SCRIPT_DIR/Sources/ClaudeCleanup/ClaudeSkillsScanner.swift" \
+  "$SCRIPT_DIR/Sources/ClaudeCleanup/ClaudeCleanupView.swift" \
   -o "$BINARY_DIR/$APP_NAME"
 
 # Info.plist
