@@ -166,14 +166,7 @@ struct RootView: View {
         PermissionsChecker.checkAsync { granted in
             hasFullDiskAccess = granted
             if !granted {
-                NSAccessibility.post(
-                    element: NSApp as Any,
-                    notification: .announcementRequested,
-                    userInfo: [
-                        .announcement: "Full Disk Access is not granted. A warning banner has appeared at the top of the ACleaner window. Use the Open Settings button to grant access, then press Check Again.",
-                        .priority: NSAccessibilityPriorityLevel.high.rawValue
-                    ]
-                )
+                Announcer.announce("Full Disk Access is not granted. A warning banner has appeared at the top of the ACleaner window. Use the Open Settings button to grant access, then press Check Again.")
             }
         }
     }

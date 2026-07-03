@@ -359,14 +359,6 @@ final class UpdateEngine: ObservableObject {
     }
 
     func announce(_ text: String) {
-        guard let win = NSApp.mainWindow ?? NSApp.windows.first else { return }
-        NSAccessibility.post(
-            element: win,
-            notification: .announcementRequested,
-            userInfo: [
-                .announcement: text,
-                .priority: NSAccessibilityPriorityLevel.high.rawValue
-            ]
-        )
+        Announcer.announce(text)
     }
 }

@@ -2,6 +2,105 @@
 
 All notable changes to ACleaner are documented in this file.
 
+## 2026-07-03 — Performance, safety, and smarter detection (Phase 1 + 2)
+
+A new `Sources/Shared/` module holds logic now used across multiple tools:
+`FileSize.swift`, `Announcer.swift`, `CleanupJournal.swift`, `ScanCache.swift`,
+`AppTokenMatcher.swift`, `ExclusionStore.swift`.
+
+### Performance
+
+**Native file sizing replaces per-file `du` process spawning**
+
+Disk Detective, the orphan scanner, the Clean Uninstall leftover scanner, and
+Claude Cleanup all measured file sizes by spawning `/bin/bash` + `du` once per
+item — the orphan scanner alone could spawn hundreds of processes per scan,
+sequentially in some code paths. `Sources/Shared/FileSize.swift` replaces
+every one of those call sites with `FileManager`'s native directory
+enumerator, batched with a bounded `TaskGroup` (max 8 concurrent). This also
+closes a shell-injection exposure: every replaced call site had embedded a
+*discovered* file path into a bash string, so a folder named with backticks
+or `$(...)` would previously have executed as shell code.
+
+Also fixed in passing: the orphan scanner's hidden dot-directory scan
+computed each candidate's size via a one-shot shell script, then discarded
+that result and re-measured every item individually with a second `du`
+process — the second measurement is now removed, reusing the value the
+script already computed.
+
+Kept as-is: the one-shot inventory scripts used for the initial `/Applications`
+sweep (they run once per scan, not once per item, and never interpolate a
+discovered path).
+
+### Safety
+
+**Undo Last Cleanup**
+
+Every deletion in ACleaner already goes through `FileManager.trashItem`
+rather than permanent deletion. `CleanupJournal` now records where each
+trashed item lands, and an "Undo" button — present in every tool's footer and
+the Clean Uninstall done screen — moves the most recent batch back to where
+it came from. Restoration fails per-item, never overwriting an existing file
+and reporting individually when the Trash copy is gone or the original spot
+is occupied.
+
+**Exclusion list for orphan and leftover scans**
+
+A false positive in the orphan scanner or Clean Uninstall's leftover matcher
+no longer needs dismissing every time it reappears. Right-click any orphan
+group (or use the VoiceOver rotor) to exclude it permanently; a new
+"Exclusions" sheet in the Orphaned Files header manages the list. One shared
+list covers both scan flows — excluding an app from Orphaned Files also keeps
+it out of Clean Uninstall's leftover results for that app.
+
+### Smarter detection
+
+**Leftover matching no longer produces false positives from substring matching**
+
+Clean Uninstall matched leftover files by checking whether the file name
+*contained* the app's name as a raw substring — so an app named "Photo" would
+match a "Photoshop" folder. The matching logic from the orphan scanner
+(word-boundary tokenization, generic-word exclusion, version-suffix
+extension matching) is now shared via `AppTokenMatcher` and used by both
+scanners, plus a substring fallback specifically against the full bundle ID
+for camelCase folder names that don't tokenize cleanly.
+
+**The Clean Uninstall dialog no longer fires for app self-updates**
+
+When an app updates itself (Sparkle, Homebrew, etc.), the old version
+typically passes through the Trash while the new one is already installed —
+which previously triggered ACleaner's uninstall dialog for an app the user
+never meant to remove. Detection now waits 2 seconds and checks whether the
+bundle ID still resolves to a live, non-Trash install; if so, it logs a
+"Ignored — updated, still installed" event instead of interrupting.
+
+**Last-activity dates on orphan rows**
+
+Each orphan group now shows when its newest file was last modified ("Last
+activity: 2 years ago"), fetched in the same enumeration pass as the size
+measurement — no extra I/O. Groups touched within the last 30 days get a
+"Recently active" caution tag, since those are the riskier deletes.
+
+### Accessibility
+
+**VoiceOver progress announcements during long scans**
+
+Disk Detective and the orphan scanner previously updated only a visual status
+label during a scan, leaving VoiceOver users in silence until it finished.
+Scans now announce start, throttled progress (at most once every 4 seconds),
+and a final summary. LLM Scanner and Claude Cleanup announce start and
+completion.
+
+### Persistence
+
+**Scan results and category state survive relaunch**
+
+Disk Detective, Orphaned Files, and LLM Scanner results are cached to disk
+and reloaded on next launch, with entries whose paths no longer exist
+dropped automatically ("Results from 2 hours ago — press Scan to refresh.").
+Disk Detective's collapsed-category state moved from in-memory `@State` to
+`@AppStorage` for the same reason.
+
 ## 2026-07-03 — Trash watcher reliability and orphan grouping
 
 ### Fixed

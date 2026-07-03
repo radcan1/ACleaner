@@ -12,13 +12,20 @@ final class ClaudeCleanupScanner: ObservableObject {
     func scan() async {
         isScanning = true
         items = []
+        Announcer.announce("Scanning Claude cleanup categories.", priority: .medium)
 
-        let found = await Task.detached(priority: .userInitiated) {
-            Self.buildItems()
-        }.value
+        let found = await Self.buildItems()
 
         items = found
         isScanning = false
+        let totalBytes = found.reduce(Int64(0)) { $0 + $1.sizeBytes }
+        let bytesLabel = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        Announcer.announce(
+            found.isEmpty
+                ? "Scan complete. Nothing to clean up."
+                : "Scan complete. \(found.count) categor\(found.count == 1 ? "y" : "ies") found, \(bytesLabel).",
+            priority: .high
+        )
     }
 
     func toggleSelection(for item: ClaudeCleanupItem) {
@@ -30,147 +37,121 @@ final class ClaudeCleanupScanner: ObservableObject {
         let toDelete = items.filter(\.isSelected).flatMap(\.paths)
         var trashed = 0
         var failed: [String] = []
+        var pairs: [TrashedRecord] = []
         for url in toDelete {
             do {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                var resultURL: NSURL?
+                try FileManager.default.trashItem(at: url, resultingItemURL: &resultURL)
                 trashed += 1
+                if let trashedPath = (resultURL as URL?)?.path {
+                    pairs.append(TrashedRecord(originalPath: url.path, trashPath: trashedPath))
+                }
             } catch {
                 failed.append("\(url.path): \(error.localizedDescription)")
             }
         }
+        CleanupJournal.shared.record(label: "Claude Cleanup", items: pairs)
         return (trashed, failed)
     }
 
-    // MARK: - Background work (nonisolated)
+    // MARK: - Background work
 
-    private nonisolated static func buildItems() -> [ClaudeCleanupItem] {
-        var found: [ClaudeCleanupItem] = []
+    private nonisolated static func buildItems() async -> [ClaudeCleanupItem] {
+        struct Category {
+            let title: String
+            let explanation: String
+            let warningNote: String?
+            let paths: [URL]
+            let isSelected: Bool
+        }
 
-        // 1. Electron caches — always safe
-        let cachePaths = existingURLs([
-            "~/Library/Application Support/Claude/Cache",
-            "~/Library/Application Support/Claude/Code Cache",
-            "~/Library/Application Support/Claude/GPUCache",
-            "~/Library/Application Support/Claude/DawnWebGPUCache",
-            "~/Library/Application Support/Claude/DawnGraphiteCache",
-        ])
-        let cacheSize = cachePaths.reduce(Int64(0)) { $0 + size(of: $1) }
-        if cacheSize > 0 {
-            found.append(ClaudeCleanupItem(
-                id: UUID(),
+        let categories: [Category] = [
+            Category(
                 title: "App Caches",
                 explanation: "Temporary files Claude downloads and generates to load faster — similar to how a web browser caches pages. They are rebuilt automatically the next time Claude starts. Completely safe to delete at any time.",
                 warningNote: nil,
-                paths: cachePaths,
-                sizeBytes: cacheSize,
+                paths: existingURLs([
+                    "~/Library/Application Support/Claude/Cache",
+                    "~/Library/Application Support/Claude/Code Cache",
+                    "~/Library/Application Support/Claude/GPUCache",
+                    "~/Library/Application Support/Claude/DawnWebGPUCache",
+                    "~/Library/Application Support/Claude/DawnGraphiteCache",
+                ]),
                 isSelected: true
-            ))
-        }
-
-        // 2. App logs
-        let logPaths = existingURLs([
-            "~/Library/Logs/Claude",
-            "~/Library/Logs/claude-chat-done.log",
-        ])
-        let logSize = logPaths.reduce(Int64(0)) { $0 + size(of: $1) }
-        if logSize > 0 {
-            found.append(ClaudeCleanupItem(
-                id: UUID(),
+            ),
+            Category(
                 title: "App Logs",
                 explanation: "Records of what Claude did while running — useful for diagnosing crashes or unexpected behaviour. New logs are created automatically as you use Claude, so deleting old ones is always safe.",
                 warningNote: nil,
-                paths: logPaths,
-                sizeBytes: logSize,
+                paths: existingURLs([
+                    "~/Library/Logs/Claude",
+                    "~/Library/Logs/claude-chat-done.log",
+                ]),
                 isSelected: true
-            ))
-        }
-
-        // 3. VM warm-start cache
-        let warmPaths = existingURLs([
-            "~/Library/Application Support/Claude/vm_bundles/warm",
-        ])
-        let warmSize = warmPaths.reduce(Int64(0)) { $0 + size(of: $1) }
-        if warmSize > 0 {
-            found.append(ClaudeCleanupItem(
-                id: UUID(),
+            ),
+            Category(
                 title: "VM Warm Cache",
                 explanation: "A pre-started virtual machine that Claude Code keeps in the background so your first command runs instantly. Deleting it just means the next Claude Code session takes a few extra seconds to start — it rebuilds itself automatically.",
                 warningNote: nil,
-                paths: warmPaths,
-                sizeBytes: warmSize,
+                paths: existingURLs([
+                    "~/Library/Application Support/Claude/vm_bundles/warm",
+                ]),
                 isSelected: true
-            ))
-        }
-
-        // 4. Agent / cowork sessions
-        let sessionDir = expand("~/Library/Application Support/Claude/local-agent-mode-sessions")
-        let sessionPaths = subdirectories(of: sessionDir).filter {
-            $0.lastPathComponent != "skills-plugin"
-        }
-        let sessionSize = sessionPaths.reduce(Int64(0)) { $0 + size(of: $1) }
-        if sessionSize > 0 {
-            found.append(ClaudeCleanupItem(
-                id: UUID(),
+            ),
+            Category(
                 title: "Agent & Cowork Sessions",
                 explanation: "Saved state from Claude's agent tasks and cowork sessions — the files Claude used to pick up where it left off in long-running jobs. Once a task is finished you no longer need these. Deleting them does not affect Claude's ability to start new tasks.",
                 warningNote: "If you have an active cowork session running right now, do not delete this — wait until the task finishes first.",
-                paths: sessionPaths,
-                sizeBytes: sessionSize,
+                paths: subdirectories(of: expand("~/Library/Application Support/Claude/local-agent-mode-sessions"))
+                    .filter { $0.lastPathComponent != "skills-plugin" },
                 isSelected: false
-            ))
-        }
-
-        // 5. Claude Code CLI project transcripts
-        let projectsDir = expand("~/.claude/projects")
-        let projectPaths = subdirectories(of: projectsDir)
-        let projectSize = projectPaths.reduce(Int64(0)) { $0 + size(of: $1) }
-        if projectSize > 0 {
-            found.append(ClaudeCleanupItem(
-                id: UUID(),
+            ),
+            Category(
                 title: "Claude Code Project Transcripts",
                 explanation: "Full conversation logs from every Claude Code session, stored per project. These let Claude Code remember your past conversations and refer back to earlier decisions. Deleting them means Claude Code will not remember previous work in those projects — it will start fresh.",
                 warningNote: "Only delete these if you are happy for Claude Code to lose its memory of past sessions in those projects.",
-                paths: projectPaths,
-                sizeBytes: projectSize,
+                paths: subdirectories(of: expand("~/.claude/projects")),
                 isSelected: false
-            ))
-        }
-
-        // 6. CLI cache and shell snapshots
-        let cliTempPaths = existingURLs([
-            "~/.claude/cache",
-            "~/.claude/shell-snapshots",
-        ])
-        let cliTempSize = cliTempPaths.reduce(Int64(0)) { $0 + size(of: $1) }
-        if cliTempSize > 0 {
-            found.append(ClaudeCleanupItem(
-                id: UUID(),
+            ),
+            Category(
                 title: "CLI Temp Files",
                 explanation: "Small temporary files the Claude command-line tool writes to speed up repeated operations and remember your shell environment. Safe to delete — they are recreated automatically the next time you run a Claude Code command.",
                 warningNote: nil,
-                paths: cliTempPaths,
-                sizeBytes: cliTempSize,
+                paths: existingURLs([
+                    "~/.claude/cache",
+                    "~/.claude/shell-snapshots",
+                ]),
                 isSelected: true
-            ))
-        }
-
-        // 7. VM sandbox bundle — large, requires explicit selection
-        let vmPaths = existingURLs([
-            "~/Library/Application Support/Claude/vm_bundles/claudevm.bundle",
-        ])
-        let vmSize = vmPaths.reduce(Int64(0)) { $0 + size(of: $1) }
-        if vmSize > 0 {
-            found.append(ClaudeCleanupItem(
-                id: UUID(),
+            ),
+            Category(
                 title: "VM Sandbox Bundle",
                 explanation: "A full virtual machine image that lets Claude Code run code safely inside an isolated sandbox, so nothing it executes can affect the rest of your Mac. This is what powers Claude Code's code-execution and cowork features.",
                 warningNote: "Deleting this means Claude Code's sandboxed code execution will not work until the bundle is re-downloaded, which can take several minutes. Only delete if you are sure you do not use those features.",
-                paths: vmPaths,
-                sizeBytes: vmSize,
+                paths: existingURLs([
+                    "~/Library/Application Support/Claude/vm_bundles/claudevm.bundle",
+                ]),
                 isSelected: false
+            ),
+        ]
+
+        // Size every category's paths in one bounded batch instead of one
+        // sequential pass per category.
+        let sizes = await FileSize.allocatedSizes(of: categories.flatMap(\.paths))
+
+        var found: [ClaudeCleanupItem] = []
+        for category in categories {
+            let totalSize = category.paths.reduce(Int64(0)) { $0 + (sizes[$1] ?? 0) }
+            guard totalSize > 0 else { continue }
+            found.append(ClaudeCleanupItem(
+                id: UUID(),
+                title: category.title,
+                explanation: category.explanation,
+                warningNote: category.warningNote,
+                paths: category.paths,
+                sizeBytes: totalSize,
+                isSelected: category.isSelected
             ))
         }
-
         return found
     }
 
@@ -196,24 +177,4 @@ final class ClaudeCleanupScanner: ObservableObject {
         }
     }
 
-    private nonisolated static func size(of url: URL) -> Int64 {
-        var total: Int64 = 0
-        guard let enumerator = FileManager.default.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
-            options: .skipsHiddenFiles
-        ) else {
-            if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-               let sz = attrs[.size] as? Int64 { return sz }
-            return 0
-        }
-        while let file = enumerator.nextObject() as? URL {
-            if let vals = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-               vals.isRegularFile == true,
-               let sz = vals.fileSize {
-                total += Int64(sz)
-            }
-        }
-        return total
-    }
 }

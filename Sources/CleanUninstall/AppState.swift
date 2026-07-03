@@ -76,14 +76,42 @@ final class AppState: ObservableObject {
         guard !alreadyHandled(trashed.trashURL.path) else { return }
         markHandled(trashed.trashURL.path)
 
-        recentEvents.insert("Detected \(trashed.displayName) in Trash", at: 0)
-        if recentEvents.count > 20 { recentEvents.removeLast() }
+        // Give a live replacement (Sparkle self-update, `brew upgrade`, etc.)
+        // a moment to land in /Applications before deciding whether this is
+        // a real uninstall. Updaters typically move the old bundle to the
+        // Trash right around the moment the new one is installed.
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard watchEnabled else { return }
 
-        phase = .detected(trashed)
-        bringToFront()
-        NotificationCenter.default.post(name: .acleanerShowCleanUninstall, object: nil)
-        SoundPlayer.playDetected()
-        announce("Warning: \(trashed.displayName) was moved to the Trash. ACleaner has switched to Clean Uninstall — review and remove its leftover files.")
+            if isLikelyAppUpdate(trashed) {
+                recentEvents.insert("Ignored \(trashed.displayName) — updated, still installed", at: 0)
+                if recentEvents.count > 20 { recentEvents.removeLast() }
+                announce(
+                    "\(trashed.displayName) appears to have been updated and is still installed. Clean Uninstall was not shown.",
+                    priority: .medium
+                )
+                return
+            }
+
+            recentEvents.insert("Detected \(trashed.displayName) in Trash", at: 0)
+            if recentEvents.count > 20 { recentEvents.removeLast() }
+
+            phase = .detected(trashed)
+            bringToFront()
+            NotificationCenter.default.post(name: .acleanerShowCleanUninstall, object: nil)
+            SoundPlayer.playDetected()
+            announce("Warning: \(trashed.displayName) was moved to the Trash. ACleaner has switched to Clean Uninstall — review and remove its leftover files.")
+        }
+    }
+
+    /// True when the app's bundle ID still resolves to a live, non-Trash
+    /// install — the signature of a self-update rather than an uninstall.
+    private func isLikelyAppUpdate(_ trashed: TrashedApp) -> Bool {
+        guard let bundleID = trashed.bundleIdentifier,
+              let installed = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        else { return false }
+        return !FileManager.default.isInTrash(installed)
     }
 
     // MARK: - Scan / cleanup
@@ -92,7 +120,7 @@ final class AppState: ObservableObject {
         phase = .scanning(trashed)
         announce("Scanning for files associated with \(trashed.displayName).")
         Task.detached(priority: .userInitiated) { [scanner] in
-            let results = scanner.scan(for: trashed)
+            let results = await scanner.scan(for: trashed)
             await MainActor.run {
                 self.phase = .results(trashed, results)
                 self.selection = Set(results.map(\.url))
@@ -117,6 +145,7 @@ final class AppState: ObservableObject {
                 self.phase = .done(app: trashed, removed: outcome.removed, failed: outcome.failed)
                 self.selection = []
                 SoundPlayer.playCleanupComplete()
+                CleanupJournal.shared.record(label: "Clean Uninstall: \(trashed.displayName)", items: outcome.trashedPairs)
                 let failedNote = outcome.failed.isEmpty
                     ? ""
                     : ". \(outcome.failed.count) item\(outcome.failed.count == 1 ? "" : "s") could not be removed."
@@ -308,14 +337,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func announce(_ message: String) {
-        NSAccessibility.post(
-            element: NSApp as Any,
-            notification: .announcementRequested,
-            userInfo: [
-                .announcement: message,
-                .priority: NSAccessibilityPriorityLevel.high.rawValue
-            ]
-        )
+    private func announce(_ message: String, priority: NSAccessibilityPriorityLevel = .high) {
+        Announcer.announce(message, priority: priority)
     }
 }

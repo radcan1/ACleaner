@@ -2,45 +2,72 @@ import Foundation
 import AppKit
 
 final class LeftoverScanner: Sendable {
-    func scan(for app: TrashedApp) -> [LeftoverFile] {
-        let needles = makeNeedles(for: app)
-        guard !needles.isEmpty else { return [] }
-
+    func scan(for app: TrashedApp) async -> [LeftoverFile] {
         var matches: [URL: LeftoverFile.Kind] = [:]
-        let manager = FileManager.default
 
-        for entry in ScanLocations.all {
-            guard manager.fileExists(atPath: entry.path) else { continue }
-            walk(root: URL(fileURLWithPath: entry.path), depth: 0, maxDepth: entry.depth) { url in
-                let name = url.lastPathComponent
-                let normalized = normalize(stripExtensionIfFile(name, isDirectory: isDirectory(url)))
-                if matchesAny(normalized: normalized, needles: needles) {
-                    matches[url] = entry.kind
+        // An app on the shared exclusion list (set from the Orphaned Files
+        // scan) is never searched for leftovers here either — one "always
+        // skip" preference covers both flows. The trashed app bundle itself
+        // still appears below since that's the literal item just trashed,
+        // not a discovered match.
+        let isExcluded = await ExclusionStore.shared.isExcluded(app.displayName)
+        if !isExcluded {
+            let needleTokens = makeIdentityTokens(for: app)
+            let bundleIDBlob = app.bundleIdentifier.map(AppTokenMatcher.pearFormat)
+                .flatMap { $0.count >= 6 ? $0 : nil }
+
+            if !needleTokens.isEmpty || bundleIDBlob != nil {
+                let manager = FileManager.default
+
+                for entry in ScanLocations.all {
+                    guard manager.fileExists(atPath: entry.path) else { continue }
+                    walk(root: URL(fileURLWithPath: entry.path), depth: 0, maxDepth: entry.depth) { url in
+                        let name = url.lastPathComponent
+                        let base = stripExtensionIfFile(name, isDirectory: isDirectory(url))
+                        let entryTokens = AppTokenMatcher.identityTokens(for: base)
+
+                        let matchesTokens = !entryTokens.isEmpty
+                            && AppTokenMatcher.tokenSetsMatch(entryTokens, needleTokens)
+                        let matchesBundleIDBlob = bundleIDBlob.map { blob in
+                            let entryBlob = AppTokenMatcher.pearFormat(base)
+                            return entryBlob.count >= 6 && entryBlob.contains(blob)
+                        } ?? false
+
+                        if matchesTokens || matchesBundleIDBlob {
+                            matches[url] = entry.kind
+                        }
+                    }
+                }
+
+                let containerMatches = findContainers(for: app)
+                for url in containerMatches {
+                    matches[url] = .containers
+                }
+
+                if let bundleID = app.bundleIdentifier,
+                   let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: bundleID),
+                   FileManager.default.fileExists(atPath: group.path) {
+                    matches[group] = .groupContainers
                 }
             }
         }
 
-        let containerMatches = findContainers(for: app)
-        for url in containerMatches {
-            matches[url] = .containers
-        }
-
-        if let bundleID = app.bundleIdentifier,
-           let group = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: bundleID),
-           FileManager.default.fileExists(atPath: group.path) {
-            matches[group] = .groupContainers
-        }
-
         let collapsed = collapseChildren(of: matches)
+
+        // Size the app bundle plus every leftover in one bounded batch instead
+        // of sequentially, one item at a time.
+        let allURLs = [app.trashURL] + collapsed.keys
+        let sizes = await FileSize.allocatedSizes(of: allURLs)
+
         let trashed = LeftoverFile(
             url: app.trashURL,
-            sizeBytes: size(of: app.trashURL),
+            sizeBytes: sizes[app.trashURL] ?? 0,
             kind: .appBundle
         )
 
         let leftovers = collapsed
             .map { url, kind in
-                LeftoverFile(url: url, sizeBytes: size(of: url), kind: kind)
+                LeftoverFile(url: url, sizeBytes: sizes[url] ?? 0, kind: kind)
             }
             .sorted { lhs, rhs in
                 if lhs.kind.rawValue == rhs.kind.rawValue {
@@ -52,46 +79,20 @@ final class LeftoverScanner: Sendable {
         return [trashed] + leftovers
     }
 
-    private func makeNeedles(for app: TrashedApp) -> [String] {
-        var set: Set<String> = []
-
-        let names = [app.displayName, app.originalName]
-        for name in names {
-            let normalized = normalize(name)
-            if normalized.count >= 4 { set.insert(normalized) }
-        }
-
+    /// Identity tokens covering the app's display name, original bundle
+    /// name, and bundle identifier. Matching leftover files against these
+    /// via AppTokenMatcher.tokenSetsMatch (word-boundary tokens, not raw
+    /// substring containment) is what stops an app like "Photo" from
+    /// matching an unrelated "Photoshop" folder — the previous whole-string
+    /// `normalized.contains(needle)` check had no word-boundary awareness.
+    private func makeIdentityTokens(for app: TrashedApp) -> Set<String> {
+        var tokens: Set<String> = []
+        tokens.formUnion(AppTokenMatcher.identityTokens(for: app.displayName))
+        tokens.formUnion(AppTokenMatcher.identityTokens(for: app.originalName))
         if let bundleID = app.bundleIdentifier, !bundleID.isEmpty {
-            set.insert(normalize(bundleID))
-
-            let components = bundleID.split(separator: ".").map(String.init)
-            if components.count >= 2 {
-                let lastTwo = components.suffix(2).joined()
-                set.insert(normalize(lastTwo))
-            }
-            if let last = components.last {
-                let normalizedLast = normalize(last)
-                if normalizedLast.count >= 4 { set.insert(normalizedLast) }
-            }
+            tokens.formUnion(AppTokenMatcher.identityTokens(for: bundleID))
         }
-
-        return Array(set)
-    }
-
-    private func matchesAny(normalized: String, needles: [String]) -> Bool {
-        guard !normalized.isEmpty else { return false }
-        for needle in needles where !needle.isEmpty {
-            if normalized == needle { return true }
-            if normalized.contains(needle) { return true }
-        }
-        return false
-    }
-
-    private func normalize(_ input: String) -> String {
-        let lowered = input.lowercased()
-        return lowered.unicodeScalars.filter { scalar in
-            CharacterSet.alphanumerics.contains(scalar)
-        }.reduce(into: "") { $0.unicodeScalars.append($1) }
+        return tokens
     }
 
     private func stripExtensionIfFile(_ name: String, isDirectory: Bool) -> String {
@@ -162,29 +163,4 @@ final class LeftoverScanner: Sendable {
         return result
     }
 
-    private func size(of url: URL) -> Int64 {
-        let manager = FileManager.default
-        var isDir: ObjCBool = false
-        guard manager.fileExists(atPath: url.path, isDirectory: &isDir) else { return 0 }
-
-        if !isDir.boolValue {
-            let attr = try? manager.attributesOfItem(atPath: url.path)
-            return (attr?[.size] as? Int64) ?? 0
-        }
-
-        var total: Int64 = 0
-        if let enumerator = manager.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) {
-            for case let child as URL in enumerator {
-                let values = try? child.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey, .isRegularFileKey])
-                if values?.isRegularFile == true {
-                    total += Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? 0)
-                }
-            }
-        }
-        return total
-    }
 }

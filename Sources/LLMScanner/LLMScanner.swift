@@ -10,10 +10,24 @@ final class LLMScanner: ObservableObject {
     var totalSize: Int64 { sources.reduce(0) { $0 + $1.totalSize } }
     var totalModels: Int { sources.reduce(0) { $0 + $1.models.count } }
 
+    private static let cacheKey = "llmModels"
+
+    init() {
+        guard let cached = ScanCache.load([LLMSource].self, key: Self.cacheKey) else { return }
+        let existing = cached.payload.compactMap { source -> LLMSource? in
+            let models = source.models.filter { FileManager.default.fileExists(atPath: $0.url.path) }
+            return models.isEmpty ? nil : LLMSource(id: source.id, name: source.name, icon: source.icon, models: models)
+        }
+        guard !existing.isEmpty else { return }
+        sources = existing
+        progress = "Results from \(ScanCache.ageLabel(cached.savedAt)) — press Scan to refresh."
+    }
+
     func scan() {
         isScanning = true
         progress = "Starting scan\u{2026}"
         sources = []
+        Announcer.announce("Scanning for local language models.", priority: .medium)
 
         Task.detached(priority: .userInitiated) { [weak self] in
             var found: [LLMSource] = []
@@ -133,10 +147,20 @@ final class LLMScanner: ObservableObject {
             ) { found.append(src) }
 
             let result = found.filter { !$0.models.isEmpty }
+            let totalModels = result.reduce(0) { $0 + $1.models.count }
+            let totalBytes  = result.reduce(Int64(0)) { $0 + $1.totalSize }
             await MainActor.run { [weak self] in
                 self?.sources = result
                 self?.isScanning = false
                 self?.progress = ""
+                ScanCache.save(result, key: Self.cacheKey)
+                let bytesLabel = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+                Announcer.announce(
+                    totalModels == 0
+                        ? "Scan complete. No local language models found."
+                        : "Scan complete. \(totalModels) model\(totalModels == 1 ? "" : "s") found, \(bytesLabel).",
+                    priority: .high
+                )
             }
         }
     }

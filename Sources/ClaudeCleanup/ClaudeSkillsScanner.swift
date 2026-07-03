@@ -30,14 +30,20 @@ final class ClaudeSkillsScanner: ObservableObject {
         let toDelete = skills.filter(\.isSelected).map(\.folderURL)
         var removed = 0
         var failed: [String] = []
+        var pairs: [TrashedRecord] = []
         for url in toDelete {
             do {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                var resultURL: NSURL?
+                try FileManager.default.trashItem(at: url, resultingItemURL: &resultURL)
                 removed += 1
+                if let trashedPath = (resultURL as URL?)?.path {
+                    pairs.append(TrashedRecord(originalPath: url.path, trashPath: trashedPath))
+                }
             } catch {
                 failed.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
+        CleanupJournal.shared.record(label: "Claude Skills & Extensions", items: pairs)
         return (removed, failed)
     }
 

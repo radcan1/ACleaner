@@ -4,8 +4,8 @@ import SwiftUI
 
 // MARK: - Model
 
-struct ScanItem: Identifiable {
-    let id = UUID()
+struct ScanItem: Identifiable, Codable {
+    var id = UUID()
     var isSelected: Bool = false
     let category: String
     let name: String
@@ -14,7 +14,7 @@ struct ScanItem: Identifiable {
     let sizeBytes: Int64
     let actionType: ActionType
 
-    enum ActionType {
+    enum ActionType: Codable {
         case deleteDirectory
         case deleteFile
         case shellCommand(String)      // opens Terminal — only for commands needing sudo
@@ -88,6 +88,16 @@ class ScanEngine: ObservableObject {
     @Published var completionSummary: ScanSummary? = nil
 
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
+    private static let cacheKey = "diskDetective"
+
+    init() {
+        guard let cached = ScanCache.load([ScanItem].self, key: Self.cacheKey) else { return }
+        let existing = cached.payload.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !existing.isEmpty else { return }
+        items = existing
+        scanComplete = true
+        scanStatus = "Results from \(ScanCache.ageLabel(cached.savedAt)) — press Scan Now to refresh."
+    }
 
     func startScan(
         includeKnown: Bool = true,
@@ -100,12 +110,14 @@ class ScanEngine: ObservableObject {
         completionSummary = nil
         items = []
         scanStartDate = Date()
+        Announcer.announce("Scan started.", priority: .medium)
 
         // Helper: append a batch and re-sort so results appear live
         func publish(_ batch: [ScanItem]) {
             items = (items + batch).sorted { $0.sizeBytes > $1.sizeBytes }
             let count = items.count
             scanStatus = "Scanning… \(count) item\(count == 1 ? "" : "s") found so far"
+            Announcer.announceThrottled(scanStatus, key: "diskDetectiveScan")
         }
 
         if includeKnown {
@@ -137,6 +149,19 @@ class ScanEngine: ObservableObject {
         scanStatus = "\(items.count) item\(items.count == 1 ? "" : "s") found"
         NSSound(named: NSSound.Name("Glass"))?.play()
         HistoryEngine.shared.record()
+        ScanCache.save(items, key: Self.cacheKey)
+        Announcer.announce(
+            "Scan complete. \(items.count) item\(items.count == 1 ? "" : "s") found, \(formatBytesForAnnouncement(totalBytes)) recoverable.",
+            priority: .high
+        )
+    }
+
+    private func formatBytesForAnnouncement(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / 1_073_741_824
+        let mb = Double(bytes) / 1_048_576
+        if gb >= 1.0 { return String(format: "%.1f gigabytes", gb) }
+        if mb >= 1.0 { return String(format: "%.0f megabytes", mb) }
+        return "less than 1 megabyte"
     }
 
     // MARK: - Scan: Known Paths
@@ -501,30 +526,14 @@ class ScanEngine: ObservableObject {
              .shellCommand("sudo rm -f /private/var/vm/sleepimage && echo 'Sleep image deleted. macOS will recreate it on next hibernate.'")),
         ]
 
-        // Filter to paths that exist (fast, synchronous), then launch all du
-        // measurements simultaneously so they run in parallel.
+        // Filter to paths that exist, then size them all in one bounded batch.
         scanStatus = "Checking known locations…"
         let existing = checks.filter { FileManager.default.fileExists(atPath: $0.path) }
-        let sizeTasks: [(Check, Task<Int64, Never>)] = existing.map { check in
-            let p = check.path
-            let t = Task.detached(priority: .utility) { () -> Int64 in
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-                proc.arguments = ["-c", "du -sk \"\(p)\" 2>/dev/null | awk '{print $1}'"]
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = Pipe()
-                try? proc.run(); proc.waitUntilExit()
-                let raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-                return (Int64(raw) ?? 0) * 1_024   // du -sk returns KB
-            }
-            return (check, t)
-        }
+        let sizes = await FileSize.allocatedSizes(ofPaths: existing.map(\.path))
 
         var result: [ScanItem] = []
-        for (check, task) in sizeTasks {
-            let size = await task.value
+        for check in existing {
+            let size = sizes[check.path] ?? 0
             guard size > 5_000_000 else { continue }
             result.append(ScanItem(
                 category: check.cat, name: check.name, detail: check.detail,
@@ -536,9 +545,11 @@ class ScanEngine: ObservableObject {
         scanStatus = "Checking iOS backups…"
         let backupBase = "\(home)/Library/Application Support/MobileSync/Backup"
         if let contents = try? FileManager.default.contentsOfDirectory(atPath: backupBase) {
+            let backupPaths = contents.map { "\(backupBase)/\($0)" }
+            let backupSizes = await FileSize.allocatedSizes(ofPaths: backupPaths)
             for backup in contents {
                 let p = "\(backupBase)/\(backup)"
-                let size = await dirSize(p)
+                let size = backupSizes[p] ?? 0
                 guard size > 10_000_000 else { continue }
                 result.append(ScanItem(
                     category: "iOS Backups",
@@ -599,10 +610,12 @@ class ScanEngine: ObservableObject {
         scanStatus = "Checking Firefox profiles…"
         let ffBase = "\(home)/Library/Application Support/Firefox/Profiles"
         if let profiles = try? FileManager.default.contentsOfDirectory(atPath: ffBase) {
+            let cachePaths = profiles.map { "\(ffBase)/\($0)/cache2" }
+                .filter { FileManager.default.fileExists(atPath: $0) }
+            let cacheSizes = await FileSize.allocatedSizes(ofPaths: cachePaths)
             for profile in profiles {
                 let cachePath = "\(ffBase)/\(profile)/cache2"
-                guard FileManager.default.fileExists(atPath: cachePath) else { continue }
-                let size = await dirSize(cachePath)
+                guard let size = cacheSizes[cachePath] else { continue }
                 guard size > 5_000_000 else { continue }
                 result.append(ScanItem(
                     category: "Browser Caches",
@@ -657,12 +670,14 @@ class ScanEngine: ObservableObject {
             find "\(home)" -maxdepth 8 -name node_modules -type d \
               -not -path '*/\\.*' 2>/dev/null | head -60
         """)
+        let paths = out.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        let sizes = await FileSize.allocatedSizes(ofPaths: paths)
+
         var result: [ScanItem] = []
         let fm = FileManager.default
         let df = DateFormatter(); df.dateFormat = "d MMM yyyy, HH:mm"
-        for path in out.split(separator: "\n").map(String.init).filter({ !$0.isEmpty }) {
-            let size = await dirSize(path)
-            guard size > 30_000_000 else { continue }
+        for path in paths {
+            guard let size = sizes[path], size > 30_000_000 else { continue }
             let project = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
             let modDate = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
             let dateLabel = modDate.map { " · last used \(df.string(from: $0))" } ?? ""
@@ -748,16 +763,20 @@ class ScanEngine: ObservableObject {
         let fm = FileManager.default
         let df = DateFormatter(); df.dateFormat = "d MMM yyyy"
 
-        for (paths, label, tip) in [
+        let groups: [([String], String, String)] = [
             (targetOut,      "build output",       "Recreate with: cargo build / mvn package"),
             (swiftBuildOut,  "Swift PM build",      "Recreate with: swift build"),
             (flutterBuildOut,"Flutter build",       "Recreate with: flutter build"),
             (nextOut,        "Next.js build cache", "Recreate with: next build"),
             (nuxtOut,        "Nuxt.js build cache", "Recreate with: nuxt build"),
-        ] {
-            for path in paths.split(separator: "\n").map(String.init).filter({ !$0.isEmpty }) {
-                let size = await dirSize(path)
-                guard size > 30_000_000 else { continue }
+        ].map { (raw, label, tip) in
+            (raw.split(separator: "\n").map(String.init).filter { !$0.isEmpty }, label, tip)
+        }
+        let sizes = await FileSize.allocatedSizes(ofPaths: groups.flatMap(\.0))
+
+        for (paths, label, tip) in groups {
+            for path in paths {
+                guard let size = sizes[path], size > 30_000_000 else { continue }
                 let project = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
                 let modDate = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
                 let dateLabel = modDate.map { " · last built \(df.string(from: $0))" } ?? ""
@@ -788,12 +807,14 @@ class ScanEngine: ObservableObject {
               fi
             done
         """)
+        let paths = out.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        let sizes = await FileSize.allocatedSizes(ofPaths: paths)
+
         var result: [ScanItem] = []
         let fm = FileManager.default
         let df = DateFormatter(); df.dateFormat = "d MMM yyyy, HH:mm"
-        for path in out.split(separator: "\n").map(String.init).filter({ !$0.isEmpty }) {
-            let size = await dirSize(path)
-            guard size > 20_000_000 else { continue }
+        for path in paths {
+            guard let size = sizes[path], size > 20_000_000 else { continue }
             let project = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
             let modDate = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
             let dateLabel = modDate.map { " · last used \(df.string(from: $0))" } ?? ""
@@ -916,28 +937,11 @@ class ScanEngine: ObservableObject {
 
         let fm = FileManager.default
         let existing = sdkChecks.filter { fm.fileExists(atPath: $0.path) }
-
-        // Launch all size measurements in parallel
-        let sizeTasks: [(SDKCheck, Task<Int64, Never>)] = existing.map { check in
-            let p = check.path
-            let t = Task.detached(priority: .utility) { () -> Int64 in
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/bin/bash")
-                proc.arguments = ["-c", "du -sk \"\(p)\" 2>/dev/null | awk '{print $1}'"]
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = Pipe()
-                try? proc.run(); proc.waitUntilExit()
-                let raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-                return (Int64(raw) ?? 0) * 1_024
-            }
-            return (check, t)
-        }
+        let sizes = await FileSize.allocatedSizes(ofPaths: existing.map(\.path))
 
         var result: [ScanItem] = []
-        for (check, task) in sizeTasks {
-            let size = await task.value
+        for check in existing {
+            let size = sizes[check.path] ?? 0
             guard size > 1_000_000 else { continue }   // 1 MB floor — skip empty SDK dirs
             result.append(ScanItem(
                 category: "SDK & Updater Caches",
@@ -1084,13 +1088,15 @@ class ScanEngine: ObservableObject {
         let toDelete = items.filter(\.isSelected)
         var succeeded = Set<UUID>()
         var freed: Int64 = 0
+        var records: [TrashedRecord] = []
 
         for item in toDelete {
-            let ok = await performDelete(item)
-            if ok {
+            let result = await performDelete(item)
+            if result.success {
                 succeeded.insert(item.id)
                 freed += item.sizeBytes
             }
+            if let record = result.record { records.append(record) }
         }
 
         items.removeAll { succeeded.contains($0.id) }
@@ -1098,32 +1104,37 @@ class ScanEngine: ObservableObject {
             lastFreedBytes = freed
             NSSound(named: NSSound.Name("Purr"))?.play()
         }
+        CleanupJournal.shared.record(label: "Disk Detective", items: records)
+        ScanCache.save(items, key: Self.cacheKey)
     }
 
     @discardableResult
-    private func performDelete(_ item: ScanItem) async -> Bool {
+    private func performDelete(_ item: ScanItem) async -> (success: Bool, record: TrashedRecord?) {
         switch item.actionType {
 
         case .deleteDirectory, .deleteFile:
             do {
+                var resultURL: NSURL?
                 try FileManager.default.trashItem(
                     at: URL(fileURLWithPath: item.path),
-                    resultingItemURL: nil
+                    resultingItemURL: &resultURL
                 )
-                return true
+                let record = (resultURL as URL?).map { TrashedRecord(originalPath: item.path, trashPath: $0.path) }
+                return (true, record)
             } catch {
-                return false
+                return (false, nil)
             }
 
         case .emptyTrash:
             let script = "tell application \"Finder\" to empty trash"
             NSAppleScript(source: script)?.executeAndReturnError(nil)
-            return true
+            return (true, nil)   // Trash is emptied, not moved — nothing to undo
 
         case .backgroundCommand(let cmd):
-            // Runs silently inside the app — no Terminal window
+            // Runs silently inside the app — no Terminal window. Not routed
+            // through trashItem, so there is nothing here to undo either.
             _ = await shell(cmd)
-            return true
+            return (true, nil)
 
         case .shellCommand(let cmd):
             // Only used for commands that genuinely need sudo — opens Terminal
@@ -1137,7 +1148,7 @@ class ScanEngine: ObservableObject {
             end tell
             """
             NSAppleScript(source: script)?.executeAndReturnError(nil)
-            return false   // user confirms in Terminal; don't remove from list yet
+            return (false, nil)   // user confirms in Terminal; don't remove from list yet
 
         case .openInFinder:
             let url = URL(fileURLWithPath: item.path)
@@ -1146,27 +1157,11 @@ class ScanEngine: ObservableObject {
             } else {
                 NSWorkspace.shared.open(url.deletingLastPathComponent())
             }
-            return false   // user deletes manually; don't remove from list
+            return (false, nil)   // user deletes manually; don't remove from list
         }
     }
 
     // MARK: - Helpers
-
-    private func dirSize(_ path: String) async -> Int64 {
-        await Task.detached(priority: .utility) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            p.arguments = ["-c", "du -sm \"\(path)\" 2>/dev/null | awk '{print $1}'"]
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            p.standardError = Pipe()
-            try? p.run()
-            p.waitUntilExit()
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-            return (Int64(out) ?? 0) * 1_048_576
-        }.value
-    }
 
     private func shell(_ command: String) async -> String {
         await Task.detached(priority: .utility) {

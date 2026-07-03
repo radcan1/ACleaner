@@ -11,12 +11,13 @@ struct AppInfo: Identifiable {
     let sizeBytes: Int64
 }
 
-struct LinkedFile: Identifiable {
-    let id = UUID()
+struct LinkedFile: Identifiable, Codable {
+    var id = UUID()
     var isSelected: Bool = false
     let path: String
     let category: String
     let sizeBytes: Int64
+    var modified: Date? = nil
 }
 
 struct DeletionResult {
@@ -25,13 +26,26 @@ struct DeletionResult {
     let freedBytes: Int64
 }
 
-struct OrphanGroup: Identifiable {
-    let id = UUID()
+struct OrphanGroup: Identifiable, Codable {
+    var id = UUID()
     var isSelected: Bool = false
     let key: String          // bare identifier, e.g. "com.example.MyApp" or "Sketch"
     var files: [LinkedFile]
 
     var totalBytes: Int64 { files.reduce(0) { $0 + $1.sizeBytes } }
+
+    /// The newest modification date among the group's files, if any are known.
+    var lastActivity: Date? {
+        files.compactMap(\.modified).max()
+    }
+
+    /// True when the newest file was touched within the last 30 days — a
+    /// signal the app might not be as gone as it looks, worth a second look
+    /// before deleting.
+    var isRecentlyActive: Bool {
+        guard let last = lastActivity else { return false }
+        return Date().timeIntervalSince(last) < 30 * 24 * 3600
+    }
 
     var displayName: String {
         // For bundle IDs show the meaningful tail; for plain names show as-is
@@ -80,6 +94,19 @@ class AppCleanerEngine: ObservableObject {
     @Published var orphanDeletionResult: DeletionResult? = nil
 
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
+    private static let orphanCacheKey = "orphans"
+
+    init() {
+        guard let cached = ScanCache.load([OrphanGroup].self, key: Self.orphanCacheKey) else { return }
+        let existing = cached.payload.compactMap { group -> OrphanGroup? in
+            var g = group
+            g.files = group.files.filter { FileManager.default.fileExists(atPath: $0.path) }
+            return g.files.isEmpty ? nil : g
+        }
+        guard !existing.isEmpty else { return }
+        orphanGroups = existing
+        orphanStatus = "Results from \(ScanCache.ageLabel(cached.savedAt)) — press Scan to refresh."
+    }
 
     // MARK: Load all installed apps
 
@@ -124,7 +151,7 @@ class AppCleanerEngine: ObservableObject {
         let name = app.name
         let fm   = FileManager.default
         var seen = Set<String>()
-        var found: [LinkedFile] = []
+        var candidates: [(category: String, path: String)] = []
 
         // Direct path checks
         let direct: [(String, String)] = [
@@ -144,8 +171,7 @@ class AppCleanerEngine: ObservableObject {
         for (category, path) in direct {
             guard !seen.contains(path), fm.fileExists(atPath: path) else { continue }
             seen.insert(path)
-            let size = await itemSize(path)
-            found.append(LinkedFile(path: path, category: category, sizeBytes: size))
+            candidates.append((category, path))
         }
 
         // Prefix-match in directories
@@ -164,8 +190,7 @@ class AppCleanerEngine: ObservableObject {
                 let path = "\(dir)/\(entry)"
                 guard !seen.contains(path) else { continue }
                 seen.insert(path)
-                let size = await itemSize(path)
-                found.append(LinkedFile(path: path, category: category, sizeBytes: size))
+                candidates.append((category, path))
             }
         }
 
@@ -176,9 +201,14 @@ class AppCleanerEngine: ObservableObject {
                 let path = "\(gcDir)/\(entry)"
                 guard !seen.contains(path) else { continue }
                 seen.insert(path)
-                let size = await itemSize(path)
-                found.append(LinkedFile(path: path, category: "Group Container", sizeBytes: size))
+                candidates.append(("Group Container", path))
             }
+        }
+
+        // Size everything in one bounded batch instead of one process per item.
+        let sizes = await FileSize.allocatedSizes(ofPaths: candidates.map(\.path))
+        let found = candidates.map { candidate in
+            LinkedFile(path: candidate.path, category: candidate.category, sizeBytes: sizes[candidate.path] ?? 0)
         }
 
         linkedFiles = found.sorted { $0.sizeBytes > $1.sizeBytes }
@@ -191,6 +221,7 @@ class AppCleanerEngine: ObservableObject {
         isOrphanScanning = true
         orphanStatus = "Building installed app inventory…"
         orphanGroups = []
+        Announcer.announce("Orphan scan started.", priority: .medium)
 
         // ── 1. Multi-root app inventory ──────────────────────────────────────
         // FIX: Previously only checked /Applications. Now includes Homebrew Cask,
@@ -318,9 +349,17 @@ class AppCleanerEngine: ObservableObject {
 
         let fm = FileManager.default
         var found: [(key: String, file: LinkedFile)] = []
+        // Candidates whose size isn't known yet — sized in one batch after the
+        // scan loop instead of one process (or even one native measurement)
+        // per entry inline, which is what made this the slowest scan in the app.
+        var pending: [(key: String, category: String, path: String)] = []
 
         for (category, dir) in scanDirs {
             orphanStatus = "Scanning \(category)…"
+            Announcer.announceThrottled(
+                "Scanning \(category). \(pending.count) candidate\(pending.count == 1 ? "" : "s") so far.",
+                key: "orphanScan"
+            )
             guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { continue }
 
             for entry in entries {
@@ -343,8 +382,9 @@ class AppCleanerEngine: ObservableObject {
                         if orphaned {
                             var key = entry
                             if key.hasSuffix(".plist") { key = String(key.dropLast(6)) }
+                            let modDate = (try? FileManager.default.attributesOfItem(atPath: fullPath))?[.modificationDate] as? Date
                             found.append((key: key, file: LinkedFile(
-                                path: fullPath, category: category, sizeBytes: 4_096)))
+                                path: fullPath, category: category, sizeBytes: 4_096, modified: modDate)))
                         }
                         continue   // handled — skip name-matching below
                     }
@@ -360,15 +400,23 @@ class AppCleanerEngine: ObservableObject {
                 // Core match: skip if the entry belongs to a currently-installed app
                 guard !entryMatchesApp(matchName) else { continue }
 
-                let size = await itemSize(fullPath)
-                guard size >= 1_000 else { continue }
-
                 var key = entry
                 for suffix in [".plist", ".savedState", ".binarycookies", ".pkd", ".db"] {
                     if key.hasSuffix(suffix) { key = String(key.dropLast(suffix.count)); break }
                 }
-                found.append((key: key, file: LinkedFile(path: fullPath, category: category, sizeBytes: size)))
+                pending.append((key: key, category: category, path: fullPath))
             }
+        }
+
+        orphanStatus = "Measuring \(pending.count) candidate\(pending.count == 1 ? "" : "s")…"
+        let sizedAndDated = await FileSize.allocatedSizesAndDates(
+            of: pending.map { URL(fileURLWithPath: $0.path) })
+        for candidate in pending {
+            let info = sizedAndDated[URL(fileURLWithPath: candidate.path)]
+            let size = info?.size ?? 0
+            guard size >= 1_000 else { continue }
+            found.append((key: candidate.key, file: LinkedFile(
+                path: candidate.path, category: candidate.category, sizeBytes: size, modified: info?.modified)))
         }
 
         // ── 4. Hidden dot-directory scan (FIX: new, Mole-style) ─────────────
@@ -405,9 +453,16 @@ class AppCleanerEngine: ObservableObject {
             guard cleanName.count >= 3 else { continue }
             guard !skipTokens.contains(where: { pearFormat(cleanName).contains($0) }) else { continue }
             guard !entryMatchesApp(cleanName) else { continue }
-            let size = await itemSize(path)
+            // The dotScript already measured this via `du -sk` (parts[1], in KB) —
+            // re-measuring here with itemSize() was a redundant second process
+            // spawn per candidate on top of the one the script already paid for.
+            let size = (Int64(parts[1]) ?? 0) * 1_024
             guard size >= 1_000 else { continue }
-            found.append((key: cleanName, file: LinkedFile(path: path, category: "Hidden Config", sizeBytes: size)))
+            // A single stat-level lookup, not a recursive walk — cheap even
+            // though the script didn't already compute it.
+            let modDate = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+            found.append((key: cleanName, file: LinkedFile(
+                path: path, category: "Hidden Config", sizeBytes: size, modified: modDate)))
         }
 
         // ── 5. Group by key, merge keys that identify the same app ──────────
@@ -421,9 +476,9 @@ class AppCleanerEngine: ObservableObject {
 
         var clusters: [(keys: [String], tokens: Set<String>, files: [LinkedFile])] = []
         for (key, files) in groupMap.sorted(by: { $0.key < $1.key }) {
-            let tokens = identityTokens(for: key)
+            let tokens = AppTokenMatcher.identityTokens(for: key)
             let matches = clusters.indices.filter { i in
-                clusters[i].tokens.contains { a in tokens.contains { b in tokensMatch(a, b) } }
+                AppTokenMatcher.tokenSetsMatch(clusters[i].tokens, tokens)
             }
             if let first = matches.first {
                 clusters[first].keys.append(key)
@@ -441,66 +496,26 @@ class AppCleanerEngine: ObservableObject {
             }
         }
 
-        orphanGroups = clusters.map { cluster in
-            OrphanGroup(key: preferredKey(cluster.keys),
+        let allGroups = clusters.map { cluster in
+            OrphanGroup(key: AppTokenMatcher.preferredKey(cluster.keys),
                         files: cluster.files.sorted { $0.sizeBytes > $1.sizeBytes })
         }.sorted { $0.totalBytes > $1.totalBytes }
+
+        // Drop groups the user has asked to always skip — never silently:
+        // the status line always reports how many were hidden this way.
+        let exclusionStore = ExclusionStore.shared
+        orphanGroups = allGroups.filter { !exclusionStore.isExcluded($0.displayName) }
+        let excludedCount = allGroups.count - orphanGroups.count
 
         isOrphanScanning = false
         let total     = orphanGroups.reduce(0) { $0 + $1.totalBytes }
         let fileCount = orphanGroups.reduce(0) { $0 + $1.files.count }
+        let excludedNote = excludedCount > 0 ? " (\(excludedCount) excluded)" : ""
         orphanStatus  = orphanGroups.isEmpty
-            ? "No orphaned files found."
-            : "\(orphanGroups.count) deleted app\(orphanGroups.count == 1 ? "" : "s") — \(fileCount) files, \(fmtBytes(total)) recoverable"
-    }
-
-    // MARK: - Orphan group merging
-
-    /// Words too generic to identify an app on their own — never used to
-    /// merge two orphan groups.
-    private static let genericTokens: Set<String> = [
-        "app","apps","application","applications","mac","macos","osx",
-        "helper","agent","agents","daemon","client","service","services",
-        "plugin","plugins","extension","launcher","updater","update",
-        "assistant","support","group","team","labs","studio","software",
-        "framework","shared","core","main","data","text","file","files",
-        "free","lite","beta","alpha","desktop","tool","tools","user",
-    ]
-
-    /// Identity tokens for a group key. For reverse-DNS bundle-id keys the
-    /// product is the last meaningful component ("com.spotify.client" →
-    /// "spotify", because "client" is generic); for plain folder names every
-    /// meaningful word counts. Empty result = key never merges.
-    private func identityTokens(for key: String) -> Set<String> {
-        let seps = CharacterSet(charactersIn: " -_.")
-        let words = key.components(separatedBy: seps)
-            .map { $0.lowercased().filter { $0.isLetter || $0.isNumber } }
-            .filter { $0.count >= 4 && !Self.genericTokens.contains($0) }
-        guard !words.isEmpty else { return [] }
-        // Reverse-DNS: com.vendor.Product — only the product token, otherwise
-        // every vendor's apps would merge into one giant group.
-        if key.split(separator: ".").count >= 3, let last = words.last {
-            return [last]
-        }
-        return Set(words)
-    }
-
-    /// Two tokens identify the same app when equal, or when one extends the
-    /// other ("sketch" / "sketch3"). The shorter side must be ≥5 characters
-    /// so short words don't glue unrelated apps together.
-    private func tokensMatch(_ a: String, _ b: String) -> Bool {
-        if a == b { return true }
-        if a.count >= 5 && b.hasPrefix(a) { return true }
-        if b.count >= 5 && a.hasPrefix(b) { return true }
-        return false
-    }
-
-    /// Most human-readable key of a merged cluster: prefer plain folder names
-    /// over reverse-DNS bundle ids, shorter over longer.
-    private func preferredKey(_ keys: [String]) -> String {
-        let plain = keys.filter { !$0.contains(".") }
-        let pool = plain.isEmpty ? keys : plain
-        return pool.min { ($0.count, $0) < ($1.count, $1) } ?? keys[0]
+            ? "No orphaned files found.\(excludedNote)"
+            : "\(orphanGroups.count) deleted app\(orphanGroups.count == 1 ? "" : "s") — \(fileCount) files, \(fmtBytes(total)) recoverable\(excludedNote)"
+        Announcer.announce("Orphan scan complete. \(orphanStatus)", priority: .high)
+        ScanCache.save(orphanGroups, key: Self.orphanCacheKey)
     }
 
     // MARK: - PearCleaner / Mole helpers
@@ -550,49 +565,51 @@ class AppCleanerEngine: ObservableObject {
     // MARK: Delete
 
     func deleteSelectedLinked() async {
-        let freed = await trashFiles(linkedFiles.filter(\.isSelected))
+        let result = await trashFiles(linkedFiles.filter(\.isSelected))
         linkedFiles.removeAll { $0.isSelected }
-        if freed > 0 { lastFreedBytes += freed }
+        if result.freed > 0 { lastFreedBytes += result.freed }
+        CleanupJournal.shared.record(label: "App Cleaner deep scan", items: result.pairs)
     }
 
     func deleteSelectedOrphans() async {
         let selected = orphanGroups.filter(\.isSelected)
         let appCount  = selected.count
         let fileCount = selected.reduce(0) { $0 + $1.files.count }
-        let freed = await trashFiles(selected.flatMap(\.files))
+        let result = await trashFiles(selected.flatMap(\.files))
         orphanGroups.removeAll { $0.isSelected }
-        if freed > 0 { lastFreedBytes += freed }
-        orphanDeletionResult = DeletionResult(appCount: appCount, fileCount: fileCount, freedBytes: freed)
+        if result.freed > 0 { lastFreedBytes += result.freed }
+        orphanDeletionResult = DeletionResult(appCount: appCount, fileCount: fileCount, freedBytes: result.freed)
+        CleanupJournal.shared.record(
+            label: "Orphaned files (\(appCount) app\(appCount == 1 ? "" : "s"))", items: result.pairs)
+        ScanCache.save(orphanGroups, key: Self.orphanCacheKey)
     }
 
-    private func trashFiles(_ files: [LinkedFile]) async -> Int64 {
+    /// Adds `group` to the shared exclusion list and hides it immediately,
+    /// so a false positive never needs dismissing twice.
+    func excludeOrphanGroup(_ group: OrphanGroup) {
+        ExclusionStore.shared.exclude(group.displayName)
+        orphanGroups.removeAll { $0.id == group.id }
+        ScanCache.save(orphanGroups, key: Self.orphanCacheKey)
+        Announcer.announce("\(group.displayName) excluded from future scans.", priority: .medium)
+    }
+
+    private func trashFiles(_ files: [LinkedFile]) async -> (freed: Int64, pairs: [TrashedRecord]) {
         var freed: Int64 = 0
+        var pairs: [TrashedRecord] = []
         for f in files {
             do {
-                try FileManager.default.trashItem(at: URL(fileURLWithPath: f.path), resultingItemURL: nil)
+                var resultURL: NSURL?
+                try FileManager.default.trashItem(at: URL(fileURLWithPath: f.path), resultingItemURL: &resultURL)
                 freed += f.sizeBytes
+                if let trashedPath = (resultURL as URL?)?.path {
+                    pairs.append(TrashedRecord(originalPath: f.path, trashPath: trashedPath))
+                }
             } catch {}
         }
-        return freed
+        return (freed, pairs)
     }
 
     // MARK: - Helpers
-
-    private func itemSize(_ path: String) async -> Int64 {
-        await Task.detached(priority: .utility) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            // Use -sk (kilobytes) instead of -sm (megabytes) so files under 1 MB
-            // still report a non-zero size and the descending sort stays accurate.
-            p.arguments = ["-c", "du -sk \"\(path)\" 2>/dev/null | awk '{print $1}'"]
-            let pipe = Pipe()
-            p.standardOutput = pipe; p.standardError = Pipe()
-            try? p.run(); p.waitUntilExit()
-            let raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-            return (Int64(raw) ?? 0) * 1_024
-        }.value
-    }
 
     private func shell(_ cmd: String) async -> String {
         await Task.detached(priority: .utility) {
@@ -714,6 +731,7 @@ struct AppCleanerView: View {
                     .font(.callout).foregroundColor(.secondary)
             }
             Spacer()
+            UndoLastCleanupButton()
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
     }
@@ -821,6 +839,7 @@ struct OrphanView: View {
     @StateObject private var engine = AppCleanerEngine()
     @State private var showDeleteConfirm  = false
     @State private var showDeletionResult = false
+    @State private var showManageExclusions = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -853,6 +872,9 @@ struct OrphanView: View {
                 Text("Deletion complete.")
             }
         }
+        .sheet(isPresented: $showManageExclusions) {
+            ManageExclusionsSheet { showManageExclusions = false }
+        }
     }
 
     private var header: some View {
@@ -868,6 +890,11 @@ struct OrphanView: View {
             }
             Spacer()
             if engine.isOrphanScanning { ProgressView().scaleEffect(0.75) }
+            Button { showManageExclusions = true } label: {
+                Label("Exclusions", systemImage: "eye.slash")
+            }
+            .buttonStyle(.borderless)
+            .accessibilityHint("Manage the list of apps always skipped by orphan and leftover scans.")
             Button { Task { await engine.findOrphans() } } label: {
                 Label(engine.isOrphanScanning ? "Scanning…" : "Scan", systemImage: "arrow.clockwise")
             }
@@ -924,7 +951,8 @@ struct OrphanView: View {
                                 get: { engine.orphanGroups[i] },
                                 set: { engine.orphanGroups[i] = $0 }
                             ),
-                            fmtBytes: engine.fmtBytes
+                            fmtBytes: engine.fmtBytes,
+                            onExclude: { engine.excludeOrphanGroup(engine.orphanGroups[i]) }
                         )
                     }
                 }
@@ -952,6 +980,7 @@ struct OrphanView: View {
                     .font(.callout).fontWeight(.medium)
             }
             Spacer()
+            UndoLastCleanupButton()
             Button("Delete Selected…") { showDeleteConfirm = true }
                 .buttonStyle(.borderedProminent).foregroundColor(.white)
                 .disabled(selected.isEmpty)
@@ -1035,6 +1064,7 @@ struct LinkedFileRow: View {
 struct OrphanGroupRow: View {
     @Binding var group: OrphanGroup
     let fmtBytes: (Int64) -> String
+    let onExclude: () -> Void
 
     var body: some View {
         // Checkbox lives outside the DisclosureGroup so the disclosure arrow
@@ -1047,7 +1077,7 @@ struct OrphanGroupRow: View {
                 .frame(width: 18)
                 .padding(.top, 4)
                 .accessibilityLabel("Select \(group.displayName)")
-                .accessibilityHint("\(group.files.count) files, \(fmtBytes(group.totalBytes)). Double-tap to toggle.")
+                .accessibilityHint("\(group.files.count) files, \(fmtBytes(group.totalBytes)). \(Self.activityLabel(for: group.lastActivity)).\(group.isRecentlyActive ? " Recently active — review before deleting." : "") Double-tap to toggle.")
                 .accessibilityValue(group.isSelected ? "checked" : "unchecked")
 
             DisclosureGroup {
@@ -1087,6 +1117,18 @@ struct OrphanGroupRow: View {
                         Text("\(group.files.count) file\(group.files.count == 1 ? "" : "s") — \(group.locationSummary)")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                        // Last activity — a confident delete has old files;
+                        // a recently-touched one deserves a second look.
+                        HStack(spacing: 5) {
+                            Text(Self.activityLabel(for: group.lastActivity))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            if group.isRecentlyActive {
+                                Label("Recently active", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption2)
+                                    .foregroundColor(.orange)
+                            }
+                        }
                         // Actual paths — this is the key context clue
                         ForEach(group.pathHints, id: \.self) { hint in
                             Text(hint)
@@ -1101,8 +1143,26 @@ struct OrphanGroupRow: View {
                         .fontWeight(.semibold).monospacedDigit()
                         .foregroundColor(group.totalBytes > 500_000_000 ? .orange : .primary)
                 }
+                .contentShape(Rectangle())
+                .contextMenu {
+                    Button(role: .destructive, action: onExclude) {
+                        Label("Exclude \(group.displayName) from Future Scans", systemImage: "eye.slash")
+                    }
+                }
+                .accessibilityAction(named: "Exclude from future scans", onExclude)
             }
         }
         .padding(.vertical, 3)
+    }
+
+    private static let relativeFormatter: RelativeDateTimeFormatter = {
+        let f = RelativeDateTimeFormatter()
+        f.unitsStyle = .full
+        return f
+    }()
+
+    private static func activityLabel(for date: Date?) -> String {
+        guard let date else { return "Last activity unknown" }
+        return "Last activity \(relativeFormatter.localizedString(for: date, relativeTo: Date()))"
     }
 }

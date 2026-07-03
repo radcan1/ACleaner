@@ -1,13 +1,13 @@
 import Foundation
 
-struct LLMModel: Identifiable {
+struct LLMModel: Identifiable, Codable {
     let id: UUID
     let name: String
     let url: URL
     let size: Int64
 }
 
-struct LLMSource: Identifiable {
+struct LLMSource: Identifiable, Codable {
     let id: UUID
     let name: String
     let icon: String

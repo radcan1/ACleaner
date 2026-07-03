@@ -421,9 +421,12 @@ struct DoneView: View {
                     .stroke(Color.orange.opacity(0.25), lineWidth: 1))
             }
 
-            Button("Done") { state.resetToIdle() }
-                .keyboardShortcut(.defaultAction)
-                .accessibilityHint("Returns to the idle screen.")
+            HStack(spacing: 12) {
+                Button("Done") { state.resetToIdle() }
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityHint("Returns to the idle screen.")
+                UndoLastCleanupButton()
+            }
             Spacer(minLength: 0)
         }
     }

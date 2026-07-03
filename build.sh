@@ -20,6 +20,13 @@ swiftc \
   -framework Cocoa \
   -framework SwiftUI \
   -O \
+  "$SCRIPT_DIR/Sources/Shared/FileSize.swift" \
+  "$SCRIPT_DIR/Sources/Shared/Announcer.swift" \
+  "$SCRIPT_DIR/Sources/Shared/CleanupJournal.swift" \
+  "$SCRIPT_DIR/Sources/Shared/ScanCache.swift" \
+  "$SCRIPT_DIR/Sources/Shared/AppTokenMatcher.swift" \
+  "$SCRIPT_DIR/Sources/Shared/ExclusionStore.swift" \
+  \
   "$SCRIPT_DIR/Sources/main.swift" \
   "$SCRIPT_DIR/Sources/RootView.swift" \
   "$SCRIPT_DIR/Sources/UpdateChecker.swift" \

@@ -13,8 +13,14 @@ struct DiskScanView: View {
     @State private var recentHours   = 24
     @State private var includeTop    = false
 
-    // Collapsed category state — persists while the app is open
-    @State private var collapsedCategories: Set<String> = []
+    // Collapsed category state — persisted across launches, not just while
+    // the app is open, so results restored from ScanCache reopen the way
+    // the user left them.
+    @AppStorage("diskDetective.collapsedCategories") private var collapsedCategoriesData: Data = Data()
+    private var collapsedCategories: Set<String> {
+        get { (try? JSONDecoder().decode(Set<String>.self, from: collapsedCategoriesData)) ?? [] }
+        nonmutating set { collapsedCategoriesData = (try? JSONEncoder().encode(newValue)) ?? Data() }
+    }
 
     // Excluded categories — hidden from results without re-scanning
     @State private var excludedCategories: Set<String> = []
@@ -456,6 +462,8 @@ struct DiskScanView: View {
                     categoryFilterPopover
                 }
             }
+
+            UndoLastCleanupButton()
 
             Button("Delete Selected") {
                 showSnapshotPrompt = true

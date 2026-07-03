@@ -150,13 +150,19 @@ class FolderSizeEngine: ObservableObject {
 
     func moveToTrash(_ item: FolderItem) async -> Bool {
         do {
+            var resultURL: NSURL?
             try FileManager.default.trashItem(at: URL(fileURLWithPath: item.path),
-                                              resultingItemURL: nil)
+                                              resultingItemURL: &resultURL)
             items.removeAll { $0.id == item.id }
             let total = items.reduce(0) { $0 + $1.sizeBytes }
             scanStatus = items.isEmpty
                 ? "This folder is empty."
                 : "\(items.count) item\(items.count == 1 ? "" : "s") \u{2014} \(formatBytes(total))"
+            if let trashedPath = (resultURL as URL?)?.path {
+                CleanupJournal.shared.record(
+                    label: "Folder Browser: \(item.name)",
+                    items: [TrashedRecord(originalPath: item.path, trashPath: trashedPath)])
+            }
             AccessibilityNotification.Announcement("\(item.name) moved to Trash.").post()
             return true
         } catch {
@@ -168,20 +174,7 @@ class FolderSizeEngine: ObservableObject {
     // MARK: Helpers
 
     private static func measureSize(_ path: String) async -> Int64 {
-        await Task.detached(priority: .utility) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            p.arguments = ["-c", "du -sk \"\(path)\" 2>/dev/null | awk '{print $1}'"]
-            let pipe = Pipe()
-            p.standardOutput = pipe
-            p.standardError  = Pipe()
-            try? p.run()
-            p.waitUntilExit()
-            let raw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                             encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-            return (Int64(raw) ?? 0) * 1_024
-        }.value
+        FileSize.allocatedSize(of: URL(fileURLWithPath: path))
     }
 
     func formatBytes(_ bytes: Int64) -> String {
@@ -418,6 +411,8 @@ struct FolderSizeView: View {
                 .accessibilityHidden(true)
 
             Spacer()
+
+            UndoLastCleanupButton()
 
             if engine.canGoUp {
                 Button {
