@@ -410,11 +410,40 @@ class AppCleanerEngine: ObservableObject {
             found.append((key: cleanName, file: LinkedFile(path: path, category: "Hidden Config", sizeBytes: size)))
         }
 
-        // ── 5. Group by key, sort largest first ──────────────────────────────
+        // ── 5. Group by key, merge keys that identify the same app ──────────
+        // A deleted app leaves differently-named traces ("com.spotify.client"
+        // in Preferences, "Spotify" in Application Support, "spotify" in hidden
+        // configs). Keyed on raw entry names these became separate groups
+        // scattered through the size-sorted list — merge groups that share an
+        // identity token so each deleted app is a single row with all its files.
         var groupMap: [String: [LinkedFile]] = [:]
         for (key, file) in found { groupMap[key, default: []].append(file) }
-        orphanGroups = groupMap.map { key, files in
-            OrphanGroup(key: key, files: files.sorted { $0.sizeBytes > $1.sizeBytes })
+
+        var clusters: [(keys: [String], tokens: Set<String>, files: [LinkedFile])] = []
+        for (key, files) in groupMap.sorted(by: { $0.key < $1.key }) {
+            let tokens = identityTokens(for: key)
+            let matches = clusters.indices.filter { i in
+                clusters[i].tokens.contains { a in tokens.contains { b in tokensMatch(a, b) } }
+            }
+            if let first = matches.first {
+                clusters[first].keys.append(key)
+                clusters[first].tokens.formUnion(tokens)
+                clusters[first].files.append(contentsOf: files)
+                // A key can bridge previously-separate clusters — fold them in
+                for i in matches.dropFirst().reversed() {
+                    clusters[first].keys.append(contentsOf: clusters[i].keys)
+                    clusters[first].tokens.formUnion(clusters[i].tokens)
+                    clusters[first].files.append(contentsOf: clusters[i].files)
+                    clusters.remove(at: i)
+                }
+            } else {
+                clusters.append((keys: [key], tokens: tokens, files: files))
+            }
+        }
+
+        orphanGroups = clusters.map { cluster in
+            OrphanGroup(key: preferredKey(cluster.keys),
+                        files: cluster.files.sorted { $0.sizeBytes > $1.sizeBytes })
         }.sorted { $0.totalBytes > $1.totalBytes }
 
         isOrphanScanning = false
@@ -423,6 +452,55 @@ class AppCleanerEngine: ObservableObject {
         orphanStatus  = orphanGroups.isEmpty
             ? "No orphaned files found."
             : "\(orphanGroups.count) deleted app\(orphanGroups.count == 1 ? "" : "s") — \(fileCount) files, \(fmtBytes(total)) recoverable"
+    }
+
+    // MARK: - Orphan group merging
+
+    /// Words too generic to identify an app on their own — never used to
+    /// merge two orphan groups.
+    private static let genericTokens: Set<String> = [
+        "app","apps","application","applications","mac","macos","osx",
+        "helper","agent","agents","daemon","client","service","services",
+        "plugin","plugins","extension","launcher","updater","update",
+        "assistant","support","group","team","labs","studio","software",
+        "framework","shared","core","main","data","text","file","files",
+        "free","lite","beta","alpha","desktop","tool","tools","user",
+    ]
+
+    /// Identity tokens for a group key. For reverse-DNS bundle-id keys the
+    /// product is the last meaningful component ("com.spotify.client" →
+    /// "spotify", because "client" is generic); for plain folder names every
+    /// meaningful word counts. Empty result = key never merges.
+    private func identityTokens(for key: String) -> Set<String> {
+        let seps = CharacterSet(charactersIn: " -_.")
+        let words = key.components(separatedBy: seps)
+            .map { $0.lowercased().filter { $0.isLetter || $0.isNumber } }
+            .filter { $0.count >= 4 && !Self.genericTokens.contains($0) }
+        guard !words.isEmpty else { return [] }
+        // Reverse-DNS: com.vendor.Product — only the product token, otherwise
+        // every vendor's apps would merge into one giant group.
+        if key.split(separator: ".").count >= 3, let last = words.last {
+            return [last]
+        }
+        return Set(words)
+    }
+
+    /// Two tokens identify the same app when equal, or when one extends the
+    /// other ("sketch" / "sketch3"). The shorter side must be ≥5 characters
+    /// so short words don't glue unrelated apps together.
+    private func tokensMatch(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        if a.count >= 5 && b.hasPrefix(a) { return true }
+        if b.count >= 5 && a.hasPrefix(b) { return true }
+        return false
+    }
+
+    /// Most human-readable key of a merged cluster: prefer plain folder names
+    /// over reverse-DNS bundle ids, shorter over longer.
+    private func preferredKey(_ keys: [String]) -> String {
+        let plain = keys.filter { !$0.contains(".") }
+        let pool = plain.isEmpty ? keys : plain
+        return pool.min { ($0.count, $0) < ($1.count, $1) } ?? keys[0]
     }
 
     // MARK: - PearCleaner / Mole helpers

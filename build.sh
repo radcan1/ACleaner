@@ -1,10 +1,12 @@
 #!/bin/bash
-# Builds ACleaner.app and places it on the Desktop.
+# Builds ACleaner.app and installs it to /Applications.
+# (Previously built to the Desktop — but the copy actually launched lives in
+# /Applications, so rebuilds silently never reached it.)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="ACleaner"
-APP_BUNDLE="$HOME/Desktop/$APP_NAME.app"
+APP_BUNDLE="/Applications/$APP_NAME.app"
 BINARY_DIR="$APP_BUNDLE/Contents/MacOS"
 
 echo "Building ACleaner..."
@@ -127,13 +129,24 @@ else
 fi
 
 echo ""
-echo "Build complete — ACleaner.app is on your Desktop."
+echo "Build complete — ACleaner.app installed in /Applications."
 echo ""
 
 if [ -z "$IDENTITY" ]; then
-  echo "No development certificate found — used ad-hoc signing."
-  echo "macOS may prompt you to re-grant Full Disk Access after each rebuild."
-  echo "Fix: open Xcode > Settings > Accounts and add your Apple ID."
+  echo "IMPORTANT: No development certificate found, so this build is ad-hoc"
+  echo "signed. macOS ties Full Disk Access to the code signature, and an"
+  echo "ad-hoc signature changes on EVERY rebuild — so any earlier Full Disk"
+  echo "Access grant no longer applies. Without it, Trash watching and the"
+  echo "Library scans silently find nothing."
+  echo ""
+  echo "After each rebuild, re-grant access:"
+  echo "  1. Open System Settings, then Privacy and Security, then Full Disk Access."
+  echo "  2. Remove ACleaner from the list if present (select it, press the minus button)."
+  echo "  3. Press the plus button and add /Applications/ACleaner.app."
+  echo "  4. Relaunch ACleaner."
+  echo ""
+  echo "Permanent fix: open Xcode > Settings > Accounts, add your Apple ID, and"
+  echo "this script will automatically sign with a stable certificate instead."
   echo ""
 fi
 

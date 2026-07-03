@@ -31,7 +31,26 @@ final class AppState: ObservableObject {
 
     private let watcher = TrashWatcher()
     private let scanner = LeftoverScanner()
-    private var seenPaths: Set<String> = []
+
+    /// Paths detected in the last few seconds. Collapses the FSEvents/polling
+    /// double-fire and watcher echoes of app-initiated moves (trashAndScan).
+    /// Entries expire so a re-trashed app triggers a fresh detection — the
+    /// previous permanent set meant the dialog only ever fired once per app
+    /// path per session, even after restore + re-trash.
+    private var recentDetections: [String: Date] = [:]
+    private static let detectionDedupeWindow: TimeInterval = 30
+
+    private func alreadyHandled(_ path: String) -> Bool {
+        let now = Date()
+        recentDetections = recentDetections.filter {
+            now.timeIntervalSince($0.value) < Self.detectionDedupeWindow
+        }
+        return recentDetections[path] != nil
+    }
+
+    private func markHandled(_ path: String) {
+        recentDetections[path] = Date()
+    }
 
     // MARK: - Trash watcher
 
@@ -54,8 +73,8 @@ final class AppState: ObservableObject {
 
     private func handleTrashed(_ trashed: TrashedApp) {
         guard watchEnabled else { return }
-        guard !seenPaths.contains(trashed.trashURL.path) else { return }
-        seenPaths.insert(trashed.trashURL.path)
+        guard !alreadyHandled(trashed.trashURL.path) else { return }
+        markHandled(trashed.trashURL.path)
 
         recentEvents.insert("Detected \(trashed.displayName) in Trash", at: 0)
         if recentEvents.count > 20 { recentEvents.removeLast() }
@@ -133,7 +152,7 @@ final class AppState: ObservableObject {
 
     /// Transitions directly to the detected phase for an app that is already in the Trash.
     func scanExistingTrashedApp(_ app: TrashedApp) {
-        seenPaths.insert(app.trashURL.path)      // prevent watcher double-firing
+        markHandled(app.trashURL.path)           // prevent watcher double-firing
         recentEvents.insert("Detected \(app.displayName) in Trash", at: 0)
         if recentEvents.count > 20 { recentEvents.removeLast() }
         phase = .detected(app)
@@ -197,6 +216,10 @@ final class AppState: ObservableObject {
                     .replacingOccurrences(of: "\"", with: "\\\"")
                 let source   = "do shell script \"\(escaped)\" with administrator privileges"
 
+                // Suppress the watcher echo up front — the move happens inside
+                // an await, so the watcher could otherwise fire first.
+                markHandled(destPath)
+
                 let shellErrMsg: String? = await Task.detached(priority: .userInitiated) {
                     var dict: NSDictionary?
                     NSAppleScript(source: source)?.executeAndReturnError(&dict)
@@ -234,7 +257,7 @@ final class AppState: ObservableObject {
             }
 
             // Prevent TrashWatcher from firing a duplicate event for the same path.
-            seenPaths.insert(trashedURL.path)
+            markHandled(trashedURL.path)
 
             recentEvents.insert("Uninstalled \(trashed.displayName)", at: 0)
             if recentEvents.count > 20 { recentEvents.removeLast() }

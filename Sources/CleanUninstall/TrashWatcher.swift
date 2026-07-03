@@ -12,11 +12,11 @@ import CoreServices
 ///    and pathExtension == "app" works directly — no directory scanning needed.
 ///
 /// 2. Polling every 5 seconds (fallback) — catches cases where FSEvents misses
-///    an event (e.g. system wake, heavy I/O load). Uses its own `polledPaths`
-///    set to avoid re-reporting pre-existing items.
+///    an event (e.g. system wake, heavy I/O load).
 ///
-/// AppState.seenPaths provides final deduplication so the UI never double-fires
-/// even if both mechanisms fire for the same app.
+/// Both mechanisms dedupe against the shared `knownPaths` set, which tracks
+/// the .app bundles currently in the Trash. AppState adds a short time-window
+/// dedup on top so the UI never double-fires for the same app.
 final class TrashWatcher: @unchecked Sendable {
     var onAppTrashed: (@Sendable (TrashedApp) -> Void)?
 
@@ -24,10 +24,12 @@ final class TrashWatcher: @unchecked Sendable {
     private var pollTimer: DispatchSourceTimer?
     private let queue = DispatchQueue(label: "com.user.acleaner.trashwatcher", qos: .utility)
 
-    /// Used only by the poll timer. Seeded at start() so pre-existing Trash
-    /// items are not re-reported. FSEvents doesn't need this — it uses
-    /// kFSEventStreamEventIdSinceNow which naturally skips historical events.
-    private var polledPaths: Set<String> = []
+    /// .app paths currently believed to be in the Trash. Entries are removed
+    /// when the item leaves the Trash (restored or Trash emptied), so
+    /// re-trashing the same app fires a fresh detection. A permanent set here
+    /// meant the dialog only ever appeared once per app path per session.
+    /// Only touched on `queue` after start() seeds it.
+    private var knownPaths: Set<String> = []
 
     private var trashPath: String {
         FileManager.default.homeDirectoryForCurrentUser
@@ -60,12 +62,12 @@ final class TrashWatcher: @unchecked Sendable {
     func start() {
         guard streamRef == nil else { return }
 
-        // Seed polledPaths so the 5-second timer doesn't fire for items already
-        // in the Trash before this session started.  (Those are surfaced by the
+        // Seed knownPaths so neither mechanism fires for items already in the
+        // Trash before this session started.  (Those are surfaced by the
         // "Apps in Trash" list in IdleView instead.)
         let trashDir = trashPath
         let existing = (try? FileManager.default.contentsOfDirectory(atPath: trashDir)) ?? []
-        polledPaths = Set(existing.map { trashDir + "/" + $0 })
+        knownPaths = Set(existing.map { trashDir + "/" + $0 })
 
         startFSEvents()
         startPolling()
@@ -123,11 +125,10 @@ final class TrashWatcher: @unchecked Sendable {
     private func pollScan() {
         let trashDir = trashPath
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: trashDir)) ?? []
+        // Forget items no longer in the Trash so a re-trash fires again.
+        knownPaths.formIntersection(Set(entries.map { trashDir + "/" + $0 }))
         for name in entries where name.hasSuffix(".app") {
-            let path = trashDir + "/" + name
-            guard !polledPaths.contains(path) else { continue }
-            polledPaths.insert(path)
-            checkPath(path)
+            checkPath(trashDir + "/" + name)
         }
     }
 
@@ -139,6 +140,17 @@ final class TrashWatcher: @unchecked Sendable {
         // Only .app bundles
         guard url.pathExtension == "app" else { return }
 
+        // FSEvents also fires when an item is renamed OUT of the Trash
+        // (restore) or deleted (empty Trash) — forget it immediately so a
+        // future re-trash is detected without waiting for the next poll.
+        guard FileManager.default.fileExists(atPath: path) else {
+            knownPaths.remove(path)
+            return
+        }
+
+        // Already known to be in the Trash — not a new arrival.
+        guard !knownPaths.contains(path) else { return }
+
         // Confirm it's genuinely inside the Trash — guards against edge cases
         // where the path looks like a Trash item but was renamed back out.
         // Same check Pearcleaner uses.
@@ -146,6 +158,7 @@ final class TrashWatcher: @unchecked Sendable {
 
         // Must be a valid, readable app bundle
         guard let trashed = TrashedApp.from(trashURL: url) else { return }
+        knownPaths.insert(path)
 
         // Never report ACleaner itself
         let bundleID = trashed.bundleIdentifier ?? ""
