@@ -197,20 +197,36 @@ struct DiskScanView: View {
             Spacer()
 
             if engine.isScanning {
-                ProgressView()
-                    .scaleEffect(0.75)
-                    .padding(.trailing, 4)
+                // Determinate — fills as each phase (known locations,
+                // Downloads, node_modules, ...) completes, instead of a
+                // spinner with no sense of how much is left.
+                if engine.totalPhases > 0 {
+                    ProgressView(value: Double(engine.completedPhases), total: Double(engine.totalPhases))
+                        .frame(width: 100)
+                        .padding(.trailing, 4)
+                        .accessibilityLabel("Scan progress")
+                        .accessibilityValue("Step \(engine.completedPhases) of \(engine.totalPhases)")
+                } else {
+                    ProgressView()
+                        .scaleEffect(0.75)
+                        .padding(.trailing, 4)
+                }
+
+                Button(role: .destructive) {
+                    engine.stopScan()
+                } label: {
+                    Label("Stop", systemImage: "stop.fill")
+                }
+                .accessibilityHint("Stops the scan and keeps whatever was found so far.")
             }
 
             Button {
-                Task {
-                    await engine.startScan(
-                        includeKnown:  includeKnown,
-                        includeRecent: includeRecent,
-                        recentHours:   recentHours,
-                        includeTop:    includeTop
-                    )
-                }
+                engine.startScan(
+                    includeKnown:  includeKnown,
+                    includeRecent: includeRecent,
+                    recentHours:   recentHours,
+                    includeTop:    includeTop
+                )
             } label: {
                 Label(engine.isScanning ? "Scanning…" : "Scan Now", systemImage: "magnifyingglass")
             }

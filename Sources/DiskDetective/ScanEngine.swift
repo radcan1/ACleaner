@@ -86,9 +86,15 @@ class ScanEngine: ObservableObject {
     @Published var lastFreedBytes: Int64 = 0
     @Published var scanStartDate: Date? = nil
     @Published var completionSummary: ScanSummary? = nil
+    /// Progress through the scan's phases (known paths, downloads, node_modules,
+    /// etc.), shown as "step N of M" — the scan doesn't count individual files
+    /// up front, so phase-level progress is what's actually knowable.
+    @Published var completedPhases: Int = 0
+    @Published var totalPhases: Int = 0
 
     private let home = FileManager.default.homeDirectoryForCurrentUser.path
     private static let cacheKey = "diskDetective"
+    private var scanTask: Task<Void, Never>?
 
     init() {
         guard let cached = ScanCache.load([ScanItem].self, key: Self.cacheKey) else { return }
@@ -99,11 +105,40 @@ class ScanEngine: ObservableObject {
         scanStatus = "Results from \(ScanCache.ageLabel(cached.savedAt)) — press Scan Now to refresh."
     }
 
+    /// Starts a scan in the background and returns immediately — the actual
+    /// work runs in `scanTask`, which `stopScan()` cancels.
     func startScan(
         includeKnown: Bool = true,
         includeRecent: Bool = false,
         recentHours: Int = 24,
         includeTop: Bool = false
+    ) {
+        scanTask?.cancel()
+        scanTask = Task { [weak self] in
+            await self?.runScan(
+                includeKnown: includeKnown,
+                includeRecent: includeRecent,
+                recentHours: recentHours,
+                includeTop: includeTop
+            )
+        }
+    }
+
+    /// Cancels the in-progress scan. Individual `du` measurements already
+    /// running are terminated (see FileSize.duSizeInKB), not left to finish.
+    func stopScan() {
+        guard isScanning else { return }
+        scanTask?.cancel()
+        isScanning = false
+        scanStatus = "Scan stopped — \(items.count) item\(items.count == 1 ? "" : "s") found before stopping."
+        Announcer.announce("Scan stopped.", priority: .high)
+    }
+
+    private func runScan(
+        includeKnown: Bool,
+        includeRecent: Bool,
+        recentHours: Int,
+        includeTop: Bool
     ) async {
         isScanning = true
         scanComplete = false
@@ -112,28 +147,44 @@ class ScanEngine: ObservableObject {
         scanStartDate = Date()
         Announcer.announce("Scan started.", priority: .medium)
 
-        // Helper: append a batch and re-sort so results appear live
-        func publish(_ batch: [ScanItem]) {
+        // Each phase is a named unit of work so progress can say "step N of M"
+        // rather than leaving the user with no sense of how much is left.
+        var phases: [(name: String, run: () async -> [ScanItem])] = []
+        if includeKnown {
+            phases.append(("known locations", scanKnownPaths))
+            phases.append(("Downloads", scanDownloadItems))
+            phases.append(("SDK and updater caches", scanSDKCaches))
+            phases.append(("node_modules", scanNodeModules))
+            phases.append(("build artifacts", scanBuildArtifacts))
+            phases.append(("Python environments", scanPythonVenvs))
+            phases.append(("stale large files", scanStaleFiles))
+        }
+        if includeRecent {
+            phases.append(("recently written files", { [weak self] in
+                await self?.scanRecentFiles(hours: recentHours) ?? []
+            }))
+        }
+        if includeTop {
+            phases.append(("largest files", scanTopFiles))
+        }
+
+        totalPhases = phases.count
+        completedPhases = 0
+
+        for phase in phases {
+            guard !Task.isCancelled else { break }
+            let batch = await phase.run()
+            guard !Task.isCancelled else { break }
             items = (items + batch).sorted { $0.sizeBytes > $1.sizeBytes }
+            completedPhases += 1
             let count = items.count
-            scanStatus = "Scanning… \(count) item\(count == 1 ? "" : "s") found so far"
+            scanStatus = "Scanning \(phase.name)… step \(completedPhases) of \(totalPhases) — \(count) item\(count == 1 ? "" : "s") found so far"
             Announcer.announceThrottled(scanStatus, key: "diskDetectiveScan")
         }
 
-        if includeKnown {
-            publish(await scanKnownPaths())
-            publish(await scanDownloadItems())
-            publish(await scanSDKCaches())
-            publish(await scanNodeModules())
-            publish(await scanBuildArtifacts())
-            publish(await scanPythonVenvs())
-            publish(await scanStaleFiles())
-        }
-        if includeRecent {
-            publish(await scanRecentFiles(hours: recentHours))
-        }
-        if includeTop {
-            publish(await scanTopFiles())
+        guard !Task.isCancelled else {
+            // stopScan() already set isScanning/scanStatus/announced.
+            return
         }
 
         let duration   = Date().timeIntervalSince(scanStartDate ?? Date())

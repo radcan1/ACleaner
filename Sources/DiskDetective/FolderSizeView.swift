@@ -173,8 +173,14 @@ class FolderSizeEngine: ObservableObject {
 
     // MARK: Helpers
 
-    private static func measureSize(_ path: String) async -> Int64 {
-        FileSize.allocatedSize(of: URL(fileURLWithPath: path))
+    // nonisolated so this doesn't inherit @MainActor from the class — without
+    // this, calling it from inside the TaskGroup below forces the (blocking,
+    // potentially slow) recursive directory walk to run on the main thread,
+    // freezing the UI. The previous du-based implementation avoided this by
+    // wrapping itself in Task.detached; that detachment was lost when it was
+    // replaced with a direct native FileManager call.
+    private nonisolated static func measureSize(_ path: String) async -> Int64 {
+        await FileSize.allocatedSize(of: URL(fileURLWithPath: path))
     }
 
     func formatBytes(_ bytes: Int64) -> String {

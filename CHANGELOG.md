@@ -2,6 +2,46 @@
 
 All notable changes to ACleaner are documented in this file.
 
+## 2026-07-06 — Fix Disk Detective hangs; add scan progress and Stop button
+
+### Fixed
+
+**Disk Detective scans could take 30+ minutes with no way to stop them**
+
+The native file-sizing change from 2026-07-03 fixed a real shell-injection
+risk in `du`-based sizing, but did so by replacing `du` with a native
+FileManager directory walk everywhere — including for whole known
+directories like `~/Library/Caches`, Xcode's DerivedData, and other large
+Library folders. That native walk has far more per-file overhead than `du`,
+so scanning large folders got dramatically slower: a scan that used to take
+well under a minute could take 30+ minutes.
+
+The actual fix was simpler than what shipped on 2026-07-03: the injection
+risk came specifically from building a shell command string
+(`bash -c "du ... \(path) ..."`), not from using `du` itself. `du` is now
+called as a direct executable with the path passed as a plain argument — no
+shell ever parses it, so the injection risk stays closed, while sizing
+speed is back to where it was before (`Sources/Shared/FileSize.swift`).
+
+Also fixed in passing: a genuine hang regression in `FolderSizeView`, where
+sizing logic that should have run in the background was accidentally left
+running on the main thread, freezing the app on every visit to Disk
+Detective. Confirmed both the speedup and the fix with targeted tests
+(file-count timing comparison, and a heartbeat-based test proving the main
+thread stays responsive).
+
+### Added
+
+**Scan progress and a Stop button**
+
+Disk Detective previously gave no indication of how far a scan had
+progressed and offered no way to cancel one in progress. It now shows a
+determinate progress bar and "step N of M" status text as it works through
+each scan phase (known locations, Downloads, node_modules, build artifacts,
+etc.), and a Stop button that genuinely cancels — including terminating any
+`du` process still running, not just refusing to start new ones — and keeps
+whatever was found before stopping.
+
 ## 2026-07-03 — Performance, safety, and smarter detection (Phase 1 + 2)
 
 A new `Sources/Shared/` module holds logic now used across multiple tools:

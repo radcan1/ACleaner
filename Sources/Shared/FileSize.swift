@@ -1,19 +1,25 @@
 import Foundation
 
-/// Native, non-shelling replacements for `du`-based size measurement.
-/// Spawning `/bin/bash` + `du` per item was the slowest code in the app and
-/// interpolated discovered file paths into shell strings — a real injection
-/// risk for names containing backticks or `$(...)`.
+/// Size measurement helpers.
+///
+/// Directory sizes are measured by shelling out to `du`, called as a direct
+/// executable with the path passed as a plain argument — NOT via
+/// `/bin/bash -c "du ... \(path) ..."`. That distinction is the whole point:
+/// passing the path as an argv element means no shell ever parses it, so
+/// backticks, `$(...)`, quotes etc. in a file name can never be interpreted
+/// as shell syntax. `du` itself is what makes this fast even for huge trees
+/// (Xcode's DerivedData, ~/Library/Caches, Photos/Mail libraries) — an
+/// earlier version of this file replaced `du` entirely with a native
+/// FileManager walk to fix the injection risk, but that made scans of large
+/// folders dramatically slower (a Disk Detective scan that used to take
+/// under a minute could take 30+ minutes). `du` was never the problem; the
+/// shell string interpolation was.
 enum FileSize {
-    private static let resourceKeys: Set<URLResourceKey> = [
-        .isRegularFileKey, .totalFileAllocatedSizeKey, .fileAllocatedSizeKey
-    ]
-    private static let resourceKeysArray = Array(resourceKeys)
-
     /// Allocated size in bytes of a single file, or the recursive allocated
-    /// size of a directory tree. Synchronous — call off the main thread for
-    /// large directories (this type does not hop threads itself).
-    static func allocatedSize(of url: URL) -> Int64 {
+    /// size of a directory tree. Cancellable — if the calling Task is
+    /// cancelled while a `du` process is running, it is terminated instead
+    /// of being left to run to completion.
+    static func allocatedSize(of url: URL) async -> Int64 {
         let manager = FileManager.default
         var isDir: ObjCBool = false
         guard manager.fileExists(atPath: url.path, isDirectory: &isDir) else { return 0 }
@@ -23,23 +29,12 @@ enum FileSize {
             return Int64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? 0)
         }
 
-        guard let enumerator = manager.enumerator(
-            at: url,
-            includingPropertiesForKeys: resourceKeysArray,
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return 0 }
-
-        var total: Int64 = 0
-        for case let child as URL in enumerator {
-            guard let values = try? child.resourceValues(forKeys: resourceKeys),
-                  values.isRegularFile == true else { continue }
-            total += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
-        }
-        return total
+        guard !Task.isCancelled else { return 0 }
+        return await duSizeInKB(of: url.path) * 1_024
     }
 
     /// Sizes many items concurrently. Bounded to 8 in flight so a batch of
-    /// hundreds of candidates doesn't spawn hundreds of enumerators at once.
+    /// hundreds of candidates doesn't spawn hundreds of `du` processes at once.
     static func allocatedSizes(of urls: [URL]) async -> [URL: Int64] {
         guard !urls.isEmpty else { return [:] }
         var results: [URL: Int64] = [:]
@@ -52,7 +47,7 @@ enum FileSize {
             func addNext() {
                 guard let url = iterator.next() else { return }
                 group.addTask(priority: .utility) {
-                    (url, allocatedSize(of: url))
+                    await (url, allocatedSize(of: url))
                 }
             }
             for _ in 0..<maxConcurrent { addNext() }
@@ -74,6 +69,36 @@ enum FileSize {
         return byPath
     }
 
+    /// Runs `du -sk <path>` as a direct process (no shell) and terminates it
+    /// if the calling Task is cancelled, so a Stop button actually stops
+    /// in-flight measurements rather than waiting for them to finish.
+    private static func duSizeInKB(of path: String) async -> Int64 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/du")
+        process.arguments = ["-sk", path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        return await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                process.terminationHandler = { _ in
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let output = String(data: data, encoding: .utf8) ?? ""
+                    let firstField = output.split(whereSeparator: { $0 == "\t" || $0 == " " }).first ?? ""
+                    continuation.resume(returning: Int64(firstField) ?? 0)
+                }
+                do {
+                    try process.run()
+                } catch {
+                    continuation.resume(returning: 0)
+                }
+            }
+        }, onCancel: {
+            process.terminate()
+        })
+    }
+
     // MARK: - Size + last-modified, in one pass
 
     private static let sizeAndDateKeys: Set<URLResourceKey> = [
@@ -82,9 +107,15 @@ enum FileSize {
     private static let sizeAndDateKeysArray = Array(sizeAndDateKeys)
 
     /// Allocated size and most-recent modification date of a file or
-    /// directory tree, fetched in the same enumeration pass so a directory
-    /// isn't walked twice. For a directory, `modified` is the newest
-    /// modification date among its regular files.
+    /// directory tree, fetched in the same native enumeration pass so a
+    /// directory isn't walked twice. For a directory, `modified` is the
+    /// newest modification date among its regular files.
+    ///
+    /// Unlike `allocatedSize`, this stays on a native FileManager walk
+    /// rather than `du` — `du` has no notion of modification dates, and the
+    /// callers of this function (orphan-scan candidates: one app's leftover
+    /// folder) are per-app leftovers rather than whole Library directories,
+    /// so the size difference is much less likely to matter in practice.
     static func allocatedSizeAndModified(of url: URL) -> (size: Int64, modified: Date?) {
         let manager = FileManager.default
         var isDir: ObjCBool = false
