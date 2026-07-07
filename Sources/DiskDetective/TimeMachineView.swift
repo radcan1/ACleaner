@@ -213,7 +213,9 @@ class TimeMachineEngine: ObservableObject {
             p.arguments = ["-c", command]
             let pipe = Pipe()
             p.standardOutput = pipe
-            p.standardError = Pipe()
+            // nullDevice, not an unread Pipe — avoids the stderr-fills-buffer
+            // deadlock with waitUntilExit().
+            p.standardError = FileHandle.nullDevice
             try? p.run()
             p.waitUntilExit()
             return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""

@@ -39,7 +39,7 @@ enum FileSize {
         guard !urls.isEmpty else { return [:] }
         var results: [URL: Int64] = [:]
         results.reserveCapacity(urls.count)
-        let maxConcurrent = 8
+        let maxConcurrent = 16
 
         await withTaskGroup(of: (URL, Int64).self) { group in
             var iterator = urls.makeIterator()
@@ -78,7 +78,14 @@ enum FileSize {
         process.arguments = ["-sk", path]
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        // Discard stderr to a null sink, NOT an unread Pipe. du emits one
+        // "Permission denied" line per blocked subfolder, and with Full Disk
+        // Access revoked (which happens on every rebuild) that is thousands of
+        // lines. An unread stderr Pipe fills its ~64KB buffer, du blocks
+        // forever on the write, its terminationHandler never fires, and the
+        // measurement hangs — freezing the whole scan. This one line is the
+        // difference between a fast scan and a scan that never finishes.
+        process.standardError = FileHandle.nullDevice
 
         return await withTaskCancellationHandler(operation: {
             await withCheckedContinuation { continuation in
@@ -148,7 +155,7 @@ enum FileSize {
         guard !urls.isEmpty else { return [:] }
         var results: [URL: (size: Int64, modified: Date?)] = [:]
         results.reserveCapacity(urls.count)
-        let maxConcurrent = 8
+        let maxConcurrent = 16
 
         await withTaskGroup(of: (URL, Int64, Date?).self) { group in
             var iterator = urls.makeIterator()

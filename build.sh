@@ -55,6 +55,7 @@ swiftc \
   "$SCRIPT_DIR/Sources/DiskDetective/HistoryView.swift" \
   "$SCRIPT_DIR/Sources/DiskDetective/AppCleanerView.swift" \
   "$SCRIPT_DIR/Sources/DiskDetective/FolderSizeView.swift" \
+  "$SCRIPT_DIR/Sources/DiskDetective/DevScanWalker.swift" \
   \
   "$SCRIPT_DIR/Sources/CleanUninstall/AppState.swift" \
   "$SCRIPT_DIR/Sources/CleanUninstall/InstalledAppsView.swift" \
@@ -120,17 +121,47 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
 </plist>
 PLIST
 
-# Code signing — prefer a stable development cert so TCC grants survive rebuilds
-IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+# Code signing — sign with a STABLE identity so the code signature (and
+# therefore the Full Disk Access grant, which macOS ties to it) stays the same
+# across rebuilds. Preference order:
+#   1. A real Apple Development / Developer ID certificate, if one exists.
+#   2. The local self-signed "ACleaner Local Signing" certificate, kept in a
+#      dedicated keychain (~/Library/Keychains/acleaner-signing.keychain-db).
+#      Set up once; see docs/signing.md. It is untrusted for distribution but
+#      gives a STABLE identity, which is all TCC needs to keep the grant.
+#   3. Ad-hoc (the old behaviour) — only if neither of the above is available,
+#      in which case Full Disk Access must be re-granted after every rebuild.
+SIGN_KC="$HOME/Library/Keychains/acleaner-signing.keychain-db"
+STABLE_CERT_NAME="ACleaner Local Signing"
+
+IDENTITY=""
+SIGN_KC_ARG=""
+
+APPLE_ID=$(security find-identity -v -p codesigning 2>/dev/null \
   | grep -E '"(Apple Development|Mac Developer|Developer ID)' \
   | head -1 \
   | sed -E 's/.*"(.+)".*/\1/')
 
+if [ -n "$APPLE_ID" ]; then
+  IDENTITY="$APPLE_ID"
+elif [ -f "$SIGN_KC" ] && security find-identity -p codesigning "$SIGN_KC" 2>/dev/null | grep -q "$STABLE_CERT_NAME"; then
+  # Unlock the dedicated keychain (it locks on logout/reboot) so codesign can
+  # use the key without an interactive prompt. Password is intentionally a
+  # fixed local value — the cert protects nothing of value off this machine.
+  security unlock-keychain -p acleaner "$SIGN_KC" >/dev/null 2>&1 || true
+  IDENTITY="$STABLE_CERT_NAME"
+  SIGN_KC_ARG="--keychain $SIGN_KC"
+fi
+
+SIGNED_STABLE=0
 if [ -n "$IDENTITY" ]; then
-  codesign --sign "$IDENTITY" --force --deep "$APP_BUNDLE" 2>/dev/null \
-    && echo "Signed with: $IDENTITY" \
-    || { codesign --sign - --force --deep "$APP_BUNDLE" 2>/dev/null || true
-         echo "(fell back to ad-hoc signing)"; }
+  if codesign --sign "$IDENTITY" $SIGN_KC_ARG --force --deep "$APP_BUNDLE" 2>/dev/null; then
+    echo "Signed with stable identity: $IDENTITY"
+    SIGNED_STABLE=1
+  else
+    codesign --sign - --force --deep "$APP_BUNDLE" 2>/dev/null || true
+    echo "(stable signing failed — fell back to ad-hoc)"
+  fi
 else
   codesign --sign - --force --deep "$APP_BUNDLE" 2>/dev/null || true
 fi
@@ -139,21 +170,19 @@ echo ""
 echo "Build complete — ACleaner.app installed in /Applications."
 echo ""
 
-if [ -z "$IDENTITY" ]; then
-  echo "IMPORTANT: No development certificate found, so this build is ad-hoc"
-  echo "signed. macOS ties Full Disk Access to the code signature, and an"
-  echo "ad-hoc signature changes on EVERY rebuild — so any earlier Full Disk"
-  echo "Access grant no longer applies. Without it, Trash watching and the"
-  echo "Library scans silently find nothing."
+if [ "$SIGNED_STABLE" = "1" ]; then
+  echo "This build is signed with a stable identity, so Full Disk Access will"
+  echo "persist across future rebuilds. If this is the FIRST build after setting"
+  echo "up signing, grant Full Disk Access one final time (System Settings >"
+  echo "Privacy & Security > Full Disk Access, remove ACleaner if listed, then add"
+  echo "/Applications/ACleaner.app). After that, it stays granted."
   echo ""
-  echo "After each rebuild, re-grant access:"
-  echo "  1. Open System Settings, then Privacy and Security, then Full Disk Access."
-  echo "  2. Remove ACleaner from the list if present (select it, press the minus button)."
-  echo "  3. Press the plus button and add /Applications/ACleaner.app."
-  echo "  4. Relaunch ACleaner."
+else
+  echo "IMPORTANT: This build is ad-hoc signed (no stable identity found). macOS"
+  echo "ties Full Disk Access to the code signature, and an ad-hoc signature"
+  echo "changes on EVERY rebuild, so the grant will need re-adding each time."
   echo ""
-  echo "Permanent fix: open Xcode > Settings > Accounts, add your Apple ID, and"
-  echo "this script will automatically sign with a stable certificate instead."
+  echo "To set up stable signing once, see docs/signing.md."
   echo ""
 fi
 

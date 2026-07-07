@@ -2,6 +2,77 @@
 
 All notable changes to ACleaner are documented in this file.
 
+## 2026-07-07 — Scan freeze fix, single-pass dev scan, accurate app usage dates, stable signing
+
+### Fixed
+
+**The real cause of scans that never finished: a stderr deadlock**
+
+When measuring folder sizes, `du`'s error output was connected to a pipe that
+nothing ever read. Whenever Full Disk Access was missing (which happened on
+every ad-hoc rebuild), `du` emitted thousands of "Permission denied" lines,
+filled the pipe's ~64 KB buffer, and blocked forever on the write — so its
+completion handler never fired and the whole scan hung. This was the true
+reason scans appeared to run for 30+ minutes: they were stuck, not slow.
+
+Fixed by routing `du`'s (and every other subprocess helper's) stderr to a null
+sink instead of an unread pipe, in `FileSize.swift`, both `shell()` helpers
+(`ScanEngine`, `AppCleanerView`), `TimeMachineView`, and `Sudo`. A reproduction
+test confirmed the old pattern froze against a permission-denied flood while
+the fixed version completed in 0.2 s.
+
+**"Last used" showed "never opened" for apps in daily use**
+
+The Applications list read `kMDItemLastUsedDate` from Spotlight, but modern
+macOS returns null for it even for apps used every day (Apple restricted the
+field), so every app read as "never opened" — making the list look like it was
+recommending deletion of apps you actively use. ACleaner now estimates last-use
+from the newest modification time among the folders an app writes to when it
+runs (its sandbox container, preferences, saved state, and Application Support
+data). Apps touched in the last 14 days are labelled "Recently used — keep it
+unless you're sure," and the section is reworded as "your biggest installed
+apps, in case you want to uninstall one" rather than a junk list. (Verified:
+Word, Excel, Chrome, etc. now show real dates; apps used today are flagged
+recently-used.)
+
+### Changed
+
+**Developer-junk discovery: eight home-folder walks collapsed into one**
+
+Finding node_modules, build folders (Rust `target`, Swift `.build`, Flutter
+`build`, Next.js `.next`, Nuxt `.nuxt`), Python virtualenvs, `.DS_Store` files,
+and stale large files previously ran eight separate full traversals of the home
+folder back-to-back, each descending *into* every match (often 100 000+ files
+apiece). A new `DevScanWalker` does all of it in a single `find` pass that
+prunes `~/Library` and the Trash and never descends into a matched folder. On a
+real home folder this completed in ~1.2 s versus the minutes the old approach
+took. (Also fixed a latent bug: the old `.next`/`.nuxt`/`.venv` searches used a
+path filter that silently excluded the very folders they were looking for.)
+
+**Scan areas now run concurrently**
+
+Known locations, Downloads, SDK caches, and the developer-folder walk run at the
+same time rather than one after another, so total scan time is the slowest
+single area instead of the sum of all of them. The `/Applications` sizing that
+used to run `du` once per app in a sequential shell loop is now a single
+parallel batch, and the per-item concurrency limit was raised from 8 to 16.
+
+### Added
+
+**Stable local code signing so Full Disk Access stops resetting**
+
+`build.sh` now signs ACleaner with a stable code-signing identity, so macOS
+keeps its Full Disk Access grant across rebuilds instead of treating each
+rebuild as a brand-new app. It prefers a real Apple Development / Developer ID
+certificate if one exists, and otherwise uses a self-signed "ACleaner Local
+Signing" certificate kept in a dedicated keychain
+(`~/Library/Keychains/acleaner-signing.keychain-db`), scoped so only
+`/usr/bin/codesign` can use it and configured to sign without a password prompt.
+Verified stable: two consecutive rebuilds produced a byte-for-byte identical
+designated requirement (`certificate leaf = H"…"`), which is what TCC keys on.
+Setup and removal are documented in `docs/signing.md`. When no stable identity
+is available, the build falls back to ad-hoc signing as before.
+
 ## 2026-07-06 — Fix Disk Detective hangs; add scan progress and Stop button
 
 ### Fixed

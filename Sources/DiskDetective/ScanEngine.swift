@@ -97,6 +97,7 @@ class ScanEngine: ObservableObject {
     private var scanTask: Task<Void, Never>?
 
     init() {
+        loadAreaDurations()
         guard let cached = ScanCache.load([ScanItem].self, key: Self.cacheKey) else { return }
         let existing = cached.payload.filter { FileManager.default.fileExists(atPath: $0.path) }
         guard !existing.isEmpty else { return }
@@ -147,45 +148,59 @@ class ScanEngine: ObservableObject {
         scanStartDate = Date()
         Announcer.announce("Scan started.", priority: .medium)
 
-        // Each phase is a named unit of work so progress can say "step N of M"
-        // rather than leaving the user with no sense of how much is left.
-        var phases: [(name: String, run: () async -> [ScanItem])] = []
+        // Each area is a named unit of work. Unlike before, they run
+        // concurrently: while one area is waiting on a `find`/`du`/`mdfind`
+        // process, the others are already running theirs. Total scan time
+        // becomes the slowest single area instead of the sum of them all.
+        // (The methods are @MainActor, so their Swift bodies interleave on the
+        // main actor at each `await`, but the actual subprocess work overlaps.)
+        struct Area { let name: String; let run: () async -> [ScanItem] }
+        var areas: [Area] = []
         if includeKnown {
-            phases.append(("known locations", scanKnownPaths))
-            phases.append(("Downloads", scanDownloadItems))
-            phases.append(("SDK and updater caches", scanSDKCaches))
-            phases.append(("node_modules", scanNodeModules))
-            phases.append(("build artifacts", scanBuildArtifacts))
-            phases.append(("Python environments", scanPythonVenvs))
-            phases.append(("stale large files", scanStaleFiles))
+            areas.append(Area(name: "known locations", run: { await self.scanKnownPaths() }))
+            areas.append(Area(name: "Downloads", run: { await self.scanDownloadItems() }))
+            areas.append(Area(name: "SDK & updater caches", run: { await self.scanSDKCaches() }))
+            areas.append(Area(name: "developer folders", run: { await self.scanDevFolders() }))
         }
         if includeRecent {
-            phases.append(("recently written files", { [weak self] in
-                await self?.scanRecentFiles(hours: recentHours) ?? []
-            }))
+            areas.append(Area(name: "recently written files", run: { await self.scanRecentFiles(hours: recentHours) }))
         }
         if includeTop {
-            phases.append(("largest files", scanTopFiles))
+            areas.append(Area(name: "largest files", run: { await self.scanTopFiles() }))
         }
 
-        totalPhases = phases.count
+        totalPhases = areas.count
         completedPhases = 0
+        let typical = typicalTotalEstimate(for: areas.map(\.name))
+        scanStatus = areas.isEmpty
+            ? "Nothing selected to scan."
+            : "Scanning \(areas.count) area\(areas.count == 1 ? "" : "s")…\(typical.map { " (usually about \($0))" } ?? "")"
 
-        for phase in phases {
-            guard !Task.isCancelled else { break }
-            let batch = await phase.run()
-            guard !Task.isCancelled else { break }
-            items = (items + batch).sorted { $0.sizeBytes > $1.sizeBytes }
-            completedPhases += 1
-            let count = items.count
-            scanStatus = "Scanning \(phase.name)… step \(completedPhases) of \(totalPhases) — \(count) item\(count == 1 ? "" : "s") found so far"
-            Announcer.announceThrottled(scanStatus, key: "diskDetectiveScan")
+        await withTaskGroup(of: (name: String, items: [ScanItem], duration: TimeInterval).self) { group in
+            for area in areas {
+                group.addTask {
+                    let start = Date()
+                    let batch = await area.run()
+                    return (area.name, batch, Date().timeIntervalSince(start))
+                }
+            }
+            for await finished in group {
+                if Task.isCancelled { continue }   // drain the group, but stop updating UI
+                items = (items + finished.items).sorted { $0.sizeBytes > $1.sizeBytes }
+                completedPhases += 1
+                areaDurations[finished.name] = finished.duration
+                let count = items.count
+                scanStatus = "Finished \(finished.name) — \(completedPhases) of \(totalPhases) area\(totalPhases == 1 ? "" : "s"), \(count) item\(count == 1 ? "" : "s") so far"
+                Announcer.announceThrottled(scanStatus, key: "diskDetectiveScan")
+            }
         }
 
         guard !Task.isCancelled else {
             // stopScan() already set isScanning/scanStatus/announced.
             return
         }
+
+        saveAreaDurations()
 
         let duration   = Date().timeIntervalSince(scanStartDate ?? Date())
         let totalBytes = items.reduce(0) { $0 + $1.sizeBytes }
@@ -205,6 +220,32 @@ class ScanEngine: ObservableObject {
             "Scan complete. \(items.count) item\(items.count == 1 ? "" : "s") found, \(formatBytesForAnnouncement(totalBytes)) recoverable.",
             priority: .high
         )
+    }
+
+    // MARK: - Per-area timing (drives the "usually about Ns" estimate)
+
+    /// Wall-clock duration of each named area on the most recent scans, so the
+    /// next scan can tell the user roughly how long to expect.
+    @Published var areaDurations: [String: TimeInterval] = [:]
+    private static let areaDurationsKey = "diskDetective.areaDurations"
+
+    private func loadAreaDurations() {
+        guard let dict = UserDefaults.standard.dictionary(forKey: Self.areaDurationsKey) as? [String: Double] else { return }
+        areaDurations = dict
+    }
+
+    private func saveAreaDurations() {
+        UserDefaults.standard.set(areaDurations, forKey: Self.areaDurationsKey)
+    }
+
+    /// Because areas run in parallel, the expected wall-clock time is roughly
+    /// the slowest area, not the sum — so the estimate is the max of the known
+    /// per-area durations. Returns nil until at least one full scan has run.
+    private func typicalTotalEstimate(for names: [String]) -> String? {
+        let known = names.compactMap { areaDurations[$0] }
+        guard let slowest = known.max(), slowest >= 1 else { return nil }
+        let seconds = Int(slowest.rounded())
+        return seconds < 60 ? "\(seconds) seconds" : "\(seconds / 60) min \(seconds % 60) sec"
     }
 
     private func formatBytesForAnnouncement(_ bytes: Int64) -> String {
@@ -613,46 +654,54 @@ class ScanEngine: ObservableObject {
             }
         }
 
-        // Applications — one entry per app ≥ 50 MB, with last-opened date from Spotlight
+        // Installed apps — largest 60 apps ≥ 50 MB. This is a "your biggest
+        // apps, in case you want to uninstall one" list, NOT a junk list, so
+        // the wording makes clear nothing here is being recommended for
+        // deletion. Sizing is one parallel du batch.
+        //
+        // "Last used" no longer comes from Spotlight's kMDItemLastUsedDate —
+        // macOS returns null for it even for apps in daily use (Apple
+        // restricted it), which made every app read as "never opened". We
+        // estimate it instead from the folders an app writes to when it runs
+        // (its container, preferences, saved state, support data).
         scanStatus = "Scanning /Applications…"
-        let appsRaw = await shell("""
-            for app in /Applications/*.app "$HOME/Applications"/*.app; do
-                [ -d "$app" ] || continue
-                sz=$(du -sm "$app" 2>/dev/null | awk '{print $1}')
-                [ -z "$sz" ] && continue
-                rawdate=$(mdls -name kMDItemLastUsedDate "$app" 2>/dev/null | awk '{print $3}')
-                lastdate=$(echo "$rawdate" | grep -v null | head -1)
-                printf '%s\t%s\t%s\n' "$sz" "${lastdate:-never}" "$app"
-            done | sort -rn | head -60
-        """)
-        let dfISO = DateFormatter(); dfISO.dateFormat = "yyyy-MM-dd"
-        let dfDisplay = DateFormatter(); dfDisplay.dateStyle = .medium; dfDisplay.timeStyle = .none
-        for line in appsRaw.split(separator: "\n").map(String.init).filter({ !$0.isEmpty }) {
-            let parts = line.split(separator: "\t", maxSplits: 2).map(String.init)
-            guard parts.count == 3 else { continue }
-            let mbStr    = parts[0].trimmingCharacters(in: .whitespaces)
-            let lastRaw  = parts[1].trimmingCharacters(in: .whitespaces)
-            let path     = parts[2].trimmingCharacters(in: .whitespaces)
-            guard !path.isEmpty, let mb = Int64(mbStr) else { continue }
-            let size = mb * 1_048_576
-            guard size >= 50_000_000 else { continue }
-            let name = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-
-            let lastUsedLabel: String
-            if lastRaw.isEmpty || lastRaw == "never" || lastRaw == "(null)" {
-                lastUsedLabel = "never opened on this Mac"
-            } else if let date = dfISO.date(from: String(lastRaw.prefix(10))) {
-                lastUsedLabel = "last opened \(dfDisplay.string(from: date))"
-            } else {
-                lastUsedLabel = "last opened \(lastRaw.prefix(10))"
+        var appPaths: [String] = []
+        for dir in ["/Applications", "\(home)/Applications"] {
+            let entries = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            for entry in entries where entry.hasSuffix(".app") {
+                appPaths.append("\(dir)/\(entry)")
             }
+        }
+        let appSizes = await FileSize.allocatedSizes(ofPaths: appPaths)
+        let dfDisplay = DateFormatter(); dfDisplay.dateStyle = .medium; dfDisplay.timeStyle = .none
+        let topApps = appPaths
+            .compactMap { path -> (path: String, size: Int64)? in
+                let size = appSizes[path] ?? 0
+                return size >= 50_000_000 ? (path, size) : nil
+            }
+            .sorted { $0.size > $1.size }
+            .prefix(60)
+        let recentlyUsedCutoff = Date().addingTimeInterval(-14 * 24 * 3600)
+        for app in topApps {
+            let appURL = URL(fileURLWithPath: app.path)
+            let name = appURL.deletingPathExtension().lastPathComponent
+            let bundleID = Bundle(url: appURL)?.bundleIdentifier
+            let lastUsed = lastUsedEstimate(bundleID: bundleID, appName: name)
 
+            let detail: String
+            if let used = lastUsed, used >= recentlyUsedCutoff {
+                detail = "Recently used (around \(dfDisplay.string(from: used))) — keep it unless you're sure you want to uninstall."
+            } else if let used = lastUsed {
+                detail = "Last used around \(dfDisplay.string(from: used)) — select only if you want to uninstall this app."
+            } else {
+                detail = "One of your installed apps — select only if you want to uninstall it."
+            }
             result.append(ScanItem(
-                category: "Applications",
+                category: "Installed Apps",
                 name: name,
-                detail: "\(lastUsedLabel) — moved to Trash to uninstall",
-                path: path,
-                sizeBytes: size,
+                detail: detail,
+                path: app.path,
+                sizeBytes: app.size,
                 actionType: .deleteDirectory
             ))
         }
@@ -679,21 +728,9 @@ class ScanEngine: ObservableObject {
             }
         }
 
-        // .DS_Store files — count them and offer a single bulk delete
-        scanStatus = "Counting .DS_Store files…"
-        let dsRaw = await shell("find \"\(home)\" -name .DS_Store 2>/dev/null | wc -l")
-        let dsCount = Int(dsRaw.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-        if dsCount > 10 {
-            let h = home
-            result.append(ScanItem(
-                category: "System",
-                name: ".DS_Store Files (\(dsCount) files)",
-                detail: "Hidden folder-view metadata files scattered across your home folder — safe to delete, macOS recreates them as needed",
-                path: h,
-                sizeBytes: Int64(dsCount) * 4_096,
-                actionType: .backgroundCommand("find \"\(h)\" -name .DS_Store -delete 2>/dev/null")
-            ))
-        }
+        // .DS_Store counting moved into scanDevFolders() — it's found in the
+        // same single home-folder walk as node_modules and friends, instead of
+        // a separate unbounded `find … | wc -l` pass.
 
         // Time Machine local snapshots
         scanStatus = "Checking Time Machine snapshots…"
@@ -713,172 +750,205 @@ class ScanEngine: ObservableObject {
         return result
     }
 
-    // MARK: - Scan: node_modules
+    // MARK: - Scan: Developer folders (one home-folder walk)
 
-    private func scanNodeModules() async -> [ScanItem] {
-        scanStatus = "Scanning for node_modules…"
-        let out = await shell("""
-            find "\(home)" -maxdepth 8 -name node_modules -type d \
-              -not -path '*/\\.*' 2>/dev/null | head -60
-        """)
-        let paths = out.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
-        let sizes = await FileSize.allocatedSizes(ofPaths: paths)
+    /// Replaces the old node_modules, build-artifacts, Python-venv, .DS_Store,
+    /// and stale-large-file scans — which each traversed the whole home folder
+    /// separately and descended into every match — with a single DevScanWalker
+    /// pass. Marker-file verification (Cargo.toml, pubspec.yaml, pyvenv.cfg, …)
+    /// that used to run as per-folder shell loops is now instant Swift
+    /// fileExists checks. Every result row (category, name, detail, thresholds,
+    /// caps, delete action) is produced identically to the old code.
+    private func scanDevFolders() async -> [ScanItem] {
+        scanStatus = "Scanning developer folders…"
+        let hits = await DevScanWalker.walk(home: home)
+        guard !Task.isCancelled else { return [] }
 
-        var result: [ScanItem] = []
         let fm = FileManager.default
-        let df = DateFormatter(); df.dateFormat = "d MMM yyyy, HH:mm"
-        for path in paths {
-            guard let size = sizes[path], size > 30_000_000 else { continue }
-            let project = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
-            let modDate = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
-            let dateLabel = modDate.map { " · last used \(df.string(from: $0))" } ?? ""
-            result.append(ScanItem(
-                category: "Dev: node_modules",
-                name: "node_modules — \(project)",
-                detail: "Restore any time with: npm install\(dateLabel)",
-                path: path,
-                sizeBytes: size,
-                actionType: .deleteDirectory
-            ))
-        }
-        return result
-    }
 
-    // MARK: - Scan: Build artifacts (Rust target/, Swift .build/, etc.)
+        // Classify each matched path by its basename.
+        var nodeModules: [String] = []
+        var builds: [(path: String, label: String, tip: String)] = []
+        var venvs: [String] = []
+        var dsStoreCount = 0
+        var staleFiles: [String] = []
 
-    private func scanBuildArtifacts() async -> [ScanItem] {
-        scanStatus = "Scanning for build artifacts…"
-
-        // target/ — Rust (has Cargo.toml in parent) or Java/Maven (has pom.xml)
-        let targetOut = await shell("""
-            find "\(home)" -maxdepth 8 -name target -type d \
-              -not -path '*/\\.*' 2>/dev/null | \
-            while read -r d; do
-                parent=$(dirname "$d")
-                if [ -f "$parent/Cargo.toml" ] || [ -f "$parent/pom.xml" ] || [ -f "$parent/build.gradle" ]; then
-                    echo "$d"
-                fi
-            done | head -40
-        """)
-
-        // .build/ — Swift Package Manager (has Package.swift in parent)
-        let swiftBuildOut = await shell("""
-            find "\(home)" -maxdepth 8 -name .build -type d \
-              -not -path '*/\\.*/.build' 2>/dev/null | \
-            while read -r d; do
-                parent=$(dirname "$d")
-                if [ -f "$parent/Package.swift" ]; then
-                    echo "$d"
-                fi
-            done | head -40
-        """)
-
-        // Flutter build/ — has pubspec.yaml in parent
-        let flutterBuildOut = await shell("""
-            find "\(home)" -maxdepth 8 -name build -type d \
-              -not -path '*/\\.*' 2>/dev/null | \
-            while read -r d; do
-                parent=$(dirname "$d")
-                if [ -f "$parent/pubspec.yaml" ]; then
-                    echo "$d"
-                fi
-            done | head -40
-        """)
-
-        // .next/ — Next.js (has next.config.js or package.json with "next" in parent)
-        let nextOut = await shell("""
-            find "\(home)" -maxdepth 8 -name .next -type d \
-              -not -path '*/\\.*' 2>/dev/null | \
-            while read -r d; do
-                parent=$(dirname "$d")
-                if [ -f "$parent/next.config.js" ] || [ -f "$parent/next.config.ts" ] || \
-                   ([ -f "$parent/package.json" ] && grep -q '"next"' "$parent/package.json" 2>/dev/null); then
-                    echo "$d"
-                fi
-            done | head -40
-        """)
-
-        // .nuxt/ — Nuxt.js
-        let nuxtOut = await shell("""
-            find "\(home)" -maxdepth 8 -name .nuxt -type d \
-              -not -path '*/\\.*' 2>/dev/null | \
-            while read -r d; do
-                parent=$(dirname "$d")
-                if [ -f "$parent/nuxt.config.js" ] || [ -f "$parent/nuxt.config.ts" ]; then
-                    echo "$d"
-                fi
-            done | head -40
-        """)
-
-        var result: [ScanItem] = []
-        let fm = FileManager.default
-        let df = DateFormatter(); df.dateFormat = "d MMM yyyy"
-
-        let groups: [([String], String, String)] = [
-            (targetOut,      "build output",       "Recreate with: cargo build / mvn package"),
-            (swiftBuildOut,  "Swift PM build",      "Recreate with: swift build"),
-            (flutterBuildOut,"Flutter build",       "Recreate with: flutter build"),
-            (nextOut,        "Next.js build cache", "Recreate with: next build"),
-            (nuxtOut,        "Nuxt.js build cache", "Recreate with: nuxt build"),
-        ].map { (raw, label, tip) in
-            (raw.split(separator: "\n").map(String.init).filter { !$0.isEmpty }, label, tip)
-        }
-        let sizes = await FileSize.allocatedSizes(ofPaths: groups.flatMap(\.0))
-
-        for (paths, label, tip) in groups {
-            for path in paths {
-                guard let size = sizes[path], size > 30_000_000 else { continue }
-                let project = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
-                let modDate = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
-                let dateLabel = modDate.map { " · last built \(df.string(from: $0))" } ?? ""
-                result.append(ScanItem(
-                    category: "Dev: Build Artifacts",
-                    name: "\(label) — \(project)",
-                    detail: "\(tip)\(dateLabel)",
-                    path: path,
-                    sizeBytes: size,
-                    actionType: .deleteDirectory
-                ))
+        for path in hits {
+            let base = (path as NSString).lastPathComponent
+            let parent = (path as NSString).deletingLastPathComponent
+            switch base {
+            case "node_modules":
+                nodeModules.append(path)
+            case "target":
+                if fileExistsAny(fm, in: parent, ["Cargo.toml", "pom.xml", "build.gradle"]) {
+                    builds.append((path, "build output", "Recreate with: cargo build / mvn package"))
+                }
+            case ".build":
+                if fm.fileExists(atPath: parent + "/Package.swift") {
+                    builds.append((path, "Swift PM build", "Recreate with: swift build"))
+                }
+            case "build":
+                if fm.fileExists(atPath: parent + "/pubspec.yaml") {
+                    builds.append((path, "Flutter build", "Recreate with: flutter build"))
+                }
+            case ".next":
+                if fm.fileExists(atPath: parent + "/next.config.js")
+                    || fm.fileExists(atPath: parent + "/next.config.ts")
+                    || packageJsonMentionsNext(fm, in: parent) {
+                    builds.append((path, "Next.js build cache", "Recreate with: next build"))
+                }
+            case ".nuxt":
+                if fm.fileExists(atPath: parent + "/nuxt.config.js")
+                    || fm.fileExists(atPath: parent + "/nuxt.config.ts") {
+                    builds.append((path, "Nuxt.js build cache", "Recreate with: nuxt build"))
+                }
+            case ".venv", "venv", ".virtualenv":
+                if fm.fileExists(atPath: path + "/pyvenv.cfg")
+                    || fm.fileExists(atPath: path + "/bin/python")
+                    || fm.fileExists(atPath: path + "/bin/python3") {
+                    venvs.append(path)
+                }
+            case ".DS_Store":
+                dsStoreCount += 1
+            default:
+                staleFiles.append(path)   // large, old file (>500 MB, >180 days)
             }
         }
+
+        // Same per-type caps as the old `head -N` limits.
+        nodeModules = Array(nodeModules.prefix(60))
+        builds = capPerLabel(builds, cap: 40)
+        staleFiles = Array(staleFiles.prefix(20))
+
+        // Size every candidate directory via du (fast) in one parallel batch.
+        let dirPaths = nodeModules + builds.map(\.path) + venvs
+        let sizes = await FileSize.allocatedSizes(ofPaths: dirPaths)
+        guard !Task.isCancelled else { return [] }
+
+        var result: [ScanItem] = []
+        let dfDateTime = DateFormatter(); dfDateTime.dateFormat = "d MMM yyyy, HH:mm"
+        let dfDate     = DateFormatter(); dfDate.dateFormat = "d MMM yyyy"
+        let dfMedium   = DateFormatter(); dfMedium.dateStyle = .medium; dfMedium.timeStyle = .none
+
+        func projectName(of path: String) -> String {
+            URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
+        }
+        func dirDate(_ path: String) -> Date? {
+            (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        }
+
+        // node_modules ( > 30 MB )
+        for path in nodeModules {
+            guard let size = sizes[path], size > 30_000_000 else { continue }
+            let dateLabel = dirDate(path).map { " · last used \(dfDateTime.string(from: $0))" } ?? ""
+            result.append(ScanItem(
+                category: "Dev: node_modules",
+                name: "node_modules — \(projectName(of: path))",
+                detail: "Restore any time with: npm install\(dateLabel)",
+                path: path, sizeBytes: size, actionType: .deleteDirectory))
+        }
+
+        // Build artifacts ( > 30 MB )
+        for build in builds {
+            guard let size = sizes[build.path], size > 30_000_000 else { continue }
+            let dateLabel = dirDate(build.path).map { " · last built \(dfDate.string(from: $0))" } ?? ""
+            result.append(ScanItem(
+                category: "Dev: Build Artifacts",
+                name: "\(build.label) — \(projectName(of: build.path))",
+                detail: "\(build.tip)\(dateLabel)",
+                path: build.path, sizeBytes: size, actionType: .deleteDirectory))
+        }
+
+        // Python virtual environments ( > 20 MB )
+        for path in venvs {
+            guard let size = sizes[path], size > 20_000_000 else { continue }
+            let dateLabel = dirDate(path).map { " · last used \(dfDateTime.string(from: $0))" } ?? ""
+            result.append(ScanItem(
+                category: "Dev: Python Envs",
+                name: "Python venv — \(projectName(of: path))",
+                detail: "Recreate with: python3 -m venv .venv\(dateLabel)",
+                path: path, sizeBytes: size, actionType: .deleteDirectory))
+        }
+
+        // .DS_Store bulk ( > 10 files )
+        if dsStoreCount > 10 {
+            let h = home
+            result.append(ScanItem(
+                category: "System",
+                name: ".DS_Store Files (\(dsStoreCount) files)",
+                detail: "Hidden folder-view metadata files scattered across your home folder — safe to delete, macOS recreates them as needed",
+                path: h,
+                sizeBytes: Int64(dsStoreCount) * 4_096,
+                actionType: .backgroundCommand("find \"\(h)\" -name .DS_Store -delete 2>/dev/null")))
+        }
+
+        // Stale large files ( > 500 MB, already older than 180 days )
+        for path in staleFiles {
+            guard let attrs = try? fm.attributesOfItem(atPath: path) else { continue }
+            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            guard size > 500_000_000 else { continue }
+            let dateStr = (attrs[.modificationDate] as? Date).map { dfMedium.string(from: $0) } ?? "unknown date"
+            result.append(ScanItem(
+                category: "Stale Large Files",
+                name: URL(fileURLWithPath: path).lastPathComponent,
+                detail: "Not modified since \(dateStr) — moved to Trash",
+                path: path, sizeBytes: size, actionType: .deleteFile))
+        }
+
         return result
     }
 
-    // MARK: - Scan: Python venvs
+    private func fileExistsAny(_ fm: FileManager, in dir: String, _ names: [String]) -> Bool {
+        names.contains { fm.fileExists(atPath: dir + "/" + $0) }
+    }
 
-    private func scanPythonVenvs() async -> [ScanItem] {
-        scanStatus = "Scanning for Python virtual environments…"
-        let out = await shell("""
-            find "\(home)" -maxdepth 8 \
-              \\( -name .venv -o -name venv -o -name .virtualenv \\) \
-              -type d -not -path '*/\\.*' 2>/dev/null | \
-            while read d; do
-              if [ -f "$d/pyvenv.cfg" ] || [ -f "$d/bin/python" ] || [ -f "$d/bin/python3" ]; then
-                echo "$d"
-              fi
-            done
-        """)
-        let paths = out.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
-        let sizes = await FileSize.allocatedSizes(ofPaths: paths)
-
-        var result: [ScanItem] = []
+    /// Best-effort "last used" date for an installed app. macOS no longer
+    /// exposes a usable kMDItemLastUsedDate (it returns null even for apps in
+    /// daily use), so we approximate from the newest modification time among
+    /// the folders an app writes to when it runs: its sandbox container,
+    /// preferences, saved window state, and Application Support data. Returns
+    /// nil only when none of those exist.
+    private func lastUsedEstimate(bundleID: String?, appName: String) -> Date? {
         let fm = FileManager.default
-        let df = DateFormatter(); df.dateFormat = "d MMM yyyy, HH:mm"
-        for path in paths {
-            guard let size = sizes[path], size > 20_000_000 else { continue }
-            let project = URL(fileURLWithPath: path).deletingLastPathComponent().lastPathComponent
-            let modDate = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
-            let dateLabel = modDate.map { " · last used \(df.string(from: $0))" } ?? ""
-            result.append(ScanItem(
-                category: "Dev: Python Envs",
-                name: "Python venv — \(project)",
-                detail: "Recreate with: python3 -m venv .venv\(dateLabel)",
-                path: path,
-                sizeBytes: size,
-                actionType: .deleteDirectory
-            ))
+        var candidates: [String] = []
+        if let bid = bundleID, !bid.isEmpty {
+            candidates += [
+                "\(home)/Library/Containers/\(bid)",
+                "\(home)/Library/Preferences/\(bid).plist",
+                "\(home)/Library/Saved Application State/\(bid).savedState",
+                "\(home)/Library/Application Support/\(bid)",
+                "\(home)/Library/HTTPStorages/\(bid)",
+            ]
         }
-        return result
+        candidates.append("\(home)/Library/Application Support/\(appName)")
+
+        var newest: Date?
+        for path in candidates {
+            guard let attrs = try? fm.attributesOfItem(atPath: path),
+                  let modified = attrs[.modificationDate] as? Date else { continue }
+            if newest == nil || modified > newest! { newest = modified }
+        }
+        return newest
+    }
+
+    private func packageJsonMentionsNext(_ fm: FileManager, in dir: String) -> Bool {
+        let pj = dir + "/package.json"
+        guard fm.fileExists(atPath: pj),
+              let content = try? String(contentsOfFile: pj, encoding: .utf8) else { return false }
+        return content.contains("\"next\"")
+    }
+
+    /// Keeps at most `cap` build folders per label (matches the old per-type
+    /// `head -40`), preserving find's traversal order.
+    private func capPerLabel(_ builds: [(path: String, label: String, tip: String)],
+                             cap: Int) -> [(path: String, label: String, tip: String)] {
+        var counts: [String: Int] = [:]
+        var out: [(path: String, label: String, tip: String)] = []
+        for b in builds where counts[b.label, default: 0] < cap {
+            out.append(b)
+            counts[b.label, default: 0] += 1
+        }
+        return out
     }
 
     // MARK: - Scan: Individual large files in Downloads
@@ -1006,41 +1076,8 @@ class ScanEngine: ObservableObject {
         return result
     }
 
-    // MARK: - Scan: Stale large files
-
-    private func scanStaleFiles() async -> [ScanItem] {
-        scanStatus = "Finding stale large files (6+ months old)…"
-        let out = await shell("""
-            find "\(home)" -maxdepth 6 -not -type d -size +500M -mtime +180 \
-              -not -path "*/Library/Application Support/MobileSync/*" \
-              -not -path "*/.Trash/*" \
-              -not -path "*/Library/Developer/*" \
-              -not -path "*/Library/Mobile Documents/*" \
-              2>/dev/null | head -20
-        """)
-        var result: [ScanItem] = []
-        let fm = FileManager.default
-        let df = DateFormatter()
-        df.dateStyle = .medium
-        df.timeStyle = .none
-        for path in out.split(separator: "\n").map(String.init).filter({ !$0.isEmpty }) {
-            guard let attrs = try? fm.attributesOfItem(atPath: path) else { continue }
-            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
-            guard size > 500_000_000 else { continue }
-            let modDate = attrs[.modificationDate] as? Date
-            let dateStr = modDate.map { df.string(from: $0) } ?? "unknown date"
-            let name = URL(fileURLWithPath: path).lastPathComponent
-            result.append(ScanItem(
-                category: "Stale Large Files",
-                name: name,
-                detail: "Not modified since \(dateStr) — moved to Trash",
-                path: path,
-                sizeBytes: size,
-                actionType: .deleteFile
-            ))
-        }
-        return result
-    }
+    // (scanStaleFiles removed — stale large files are now found in the same
+    // single DevScanWalker pass as node_modules and .DS_Store.)
 
     // MARK: - Scan: Recent large files (time-based)
 
@@ -1221,7 +1258,11 @@ class ScanEngine: ObservableObject {
             p.arguments = ["-c", command]
             let pipe = Pipe()
             p.standardOutput = pipe
-            p.standardError = Pipe()
+            // nullDevice, not an unread Pipe: with waitUntilExit() below, a
+            // command that writes a lot to stderr would fill an unread stderr
+            // pipe and deadlock (process blocks on the stderr write, never
+            // exits, waitUntilExit never returns).
+            p.standardError = FileHandle.nullDevice
             try? p.run()
             p.waitUntilExit()
             return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""

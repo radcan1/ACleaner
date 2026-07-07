@@ -108,8 +108,10 @@ enum Sudo {
             var combined = ProcessInfo.processInfo.environment
             for (k, v) in env { combined[k] = v }
             p.environment = combined
-            p.standardOutput = Pipe()
-            p.standardError = Pipe()
+            // Only the exit status matters here; discard both streams to null
+            // rather than leaving unread pipes around.
+            p.standardOutput = FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
             p.terminationHandler = { proc in
                 continuation.resume(returning: proc.terminationStatus == 0)
             }

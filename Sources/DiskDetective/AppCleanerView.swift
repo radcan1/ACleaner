@@ -617,7 +617,10 @@ class AppCleanerEngine: ObservableObject {
             p.executableURL = URL(fileURLWithPath: "/bin/bash")
             p.arguments = ["-c", cmd]
             let pipe = Pipe()
-            p.standardOutput = pipe; p.standardError = Pipe()
+            p.standardOutput = pipe
+            // nullDevice, not an unread Pipe — see ScanEngine.shell for why an
+            // unread stderr pipe deadlocks with waitUntilExit().
+            p.standardError = FileHandle.nullDevice
             try? p.run(); p.waitUntilExit()
             return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         }.value
