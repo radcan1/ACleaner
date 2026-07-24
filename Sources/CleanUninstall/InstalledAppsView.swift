@@ -81,6 +81,92 @@ final class InstalledAppScanner: ObservableObject {
     }
 }
 
+// MARK: - Inline App Picker (embedded in the Uninstall idle screen)
+
+/// The streamlined picker: search + list, always visible, no sheet. Pressing
+/// an app starts the uninstall immediately — moving to Trash is reversible,
+/// so no confirmation dialog. The only question left is for running apps.
+struct InlineAppPicker: View {
+    /// Called with the URL of the chosen app *before* it is trashed.
+    let onSelect: (URL) -> Void
+    @StateObject private var scanner = InstalledAppScanner()
+    @State private var pendingApp: InstalledApp? = nil
+    @State private var showRunningAlert = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                TextField("Search apps", text: $scanner.searchText)
+                    .textFieldStyle(.plain)
+                    .accessibilityLabel("Search installed apps")
+                if !scanner.searchText.isEmpty {
+                    Button {
+                        scanner.searchText = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+
+            Divider()
+
+            if scanner.isScanning {
+                Text("Finding installed apps…")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if scanner.filtered.isEmpty {
+                Text(scanner.searchText.isEmpty
+                     ? "No applications found."
+                     : "No apps match \"\(scanner.searchText)\".")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(scanner.filtered) { app in
+                    AppPickerRow(app: app) { selectApp(app) }
+                }
+                .listStyle(.inset(alternatesRowBackgrounds: true))
+                .accessibilityLabel("Installed apps. \(scanner.filtered.count) shown. Press Enter on an app to uninstall it — the app moves to the Trash and its leftovers are scanned.")
+            }
+        }
+        .task { await scanner.scan() }
+        .alert("App Is Currently Open", isPresented: $showRunningAlert, presenting: pendingApp) { app in
+            Button("Quit & Uninstall", role: .destructive) {
+                if !app.bundleIdentifier.isEmpty {
+                    NSRunningApplication
+                        .runningApplications(withBundleIdentifier: app.bundleIdentifier)
+                        .forEach { $0.terminate() }
+                }
+                onSelect(URL(fileURLWithPath: app.path))
+                pendingApp = nil
+            }
+            Button("Uninstall Anyway") {
+                onSelect(URL(fileURLWithPath: app.path))
+                pendingApp = nil
+            }
+            Button("Cancel", role: .cancel) { pendingApp = nil }
+        } message: { app in
+            Text("\"\(app.name)\" is currently running. \"Quit & Uninstall\" will send it a quit signal first.")
+        }
+    }
+
+    private func selectApp(_ app: InstalledApp) {
+        if app.isRunning {
+            pendingApp = app
+            showRunningAlert = true
+        } else {
+            onSelect(URL(fileURLWithPath: app.path))
+        }
+    }
+}
+
 // MARK: - App Picker Sheet
 
 struct AppPickerSheet: View {

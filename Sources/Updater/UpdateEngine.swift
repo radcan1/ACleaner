@@ -46,6 +46,7 @@ final class UpdateEngine: ObservableObject {
     @Published var items: [OutdatedItem] = []           // visible items (skip-filtered)
     @Published var hiddenSkippedCount: Int = 0          // outdated items that were filtered out
     @Published var checkStatus: String = ""
+    @Published var warningNote: String = ""             // non-fatal problems from the last check
 
     // Options
     @Published var includeMas: Bool = true
@@ -83,20 +84,51 @@ final class UpdateEngine: ObservableObject {
         items = []
         hiddenSkippedCount = 0
         failedItems = []
+        warningNote = ""
+        var warnings: [String] = []
 
         checkStatus = "Updating Homebrew catalog…"
         announce("Updating Homebrew catalog.")
-        _ = await CommandRunner.runOnce(executable: brew, args: ["update"])
+        let (updateStatus, _, _) = await CommandRunner.runOnce(
+            executable: brew, args: ["update"], timeoutSeconds: 300)
+        if updateStatus != 0 {
+            // Stale catalog still yields useful results; warn, don't abort.
+            warnings.append("Catalog refresh failed — results may be stale.")
+        }
 
         checkStatus = "Checking outdated brews…"
-        let brewOutdated = await readBrewOutdated(brew: brew, greedy: includeGreedy)
+        var collected: [OutdatedItem]
+        switch await readBrewOutdated(brew: brew, greedy: includeGreedy) {
+        case .success(let list):
+            collected = list
+        case .failure(let failure):
+            // A failed check must never look like "everything is up to date".
+            state = .idle
+            checkStatus = "Update check failed: \(failure.message)"
+            announce("Update check failed.")
+            return
+        }
 
-        var collected = brewOutdated
+        checkStatus = "Verifying installed versions…"
+        let verified = await verifyCasksOnDisk(brew: brew, items: collected)
+        collected = verified.items
+        if !verified.removedApps.isEmpty {
+            let n = verified.removedApps.count
+            warnings.append("\(n) deleted app\(n == 1 ? "" : "s") ignored — clean up in Maintenance.")
+        }
 
-        if includeMas, let mas = CommandRunner.masPath {
-            checkStatus = "Checking App Store updates…"
-            let masOutdated = await readMasOutdated(mas: mas)
-            collected += masOutdated
+        if includeMas {
+            if let mas = CommandRunner.masPath {
+                checkStatus = "Checking App Store updates…"
+                switch await readMasOutdated(mas: mas) {
+                case .success(let list):
+                    collected += list
+                case .failure:
+                    warnings.append("App Store check failed.")
+                }
+            } else {
+                warnings.append("mas not installed — App Store apps not checked.")
+            }
         }
 
         // Apply skip list.
@@ -106,10 +138,13 @@ final class UpdateEngine: ObservableObject {
         items = visible
         state = .ready
         checkStatus = ""
+        warningNote = warnings.joined(separator: " ")
         let skippedSuffix = hiddenSkippedCount > 0 ? " (\(hiddenSkippedCount) skipped)" : ""
-        announce(visible.isEmpty
+        let warningSuffix = warnings.isEmpty ? "" : " Warning: \(warningNote)"
+        announce((visible.isEmpty
             ? "No updates available\(skippedSuffix)."
             : "\(visible.count) update\(visible.count == 1 ? "" : "s") available\(skippedSuffix).")
+            + warningSuffix)
 
         // Best-effort: resolve download sizes in the background. As each
         // size arrives we update the corresponding item in-place; SwiftUI
@@ -264,89 +299,221 @@ final class UpdateEngine: ObservableObject {
 
     // MARK: Parsers
 
-    private func readBrewOutdated(brew: String, greedy: Bool) async -> [OutdatedItem] {
+    struct CheckFailure: Error {
+        let message: String
+    }
+
+    /// Last few stderr lines, flattened for a one-line status message.
+    private func errTail(_ err: String, lines: Int = 3) -> String {
+        let all = err.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        return all.suffix(lines).joined(separator: " ")
+    }
+
+    private func readBrewOutdated(brew: String, greedy: Bool) async -> Result<[OutdatedItem], CheckFailure> {
         var args = ["outdated", "--json=v2"]
         if greedy { args.append("--greedy") }
-        let (_, out) = await CommandRunner.runOnce(executable: brew, args: args)
-        guard let data = out.data(using: .utf8) else { return [] }
-
-        struct OutdatedJSON: Decodable {
-            struct Formula: Decodable {
-                let name: String
-                let installed_versions: [String]?
-                let current_version: String?
-            }
-            struct Cask: Decodable {
-                let name: String
-                let installed_versions: String?
-                let current_version: String?
-            }
-            let formulae: [Formula]
-            let casks: [Cask]
+        let (status, out, err) = await CommandRunner.runOnce(
+            executable: brew, args: args, timeoutSeconds: 120)
+        guard status == 0 else {
+            let detail = errTail(err)
+            return .failure(CheckFailure(message: detail.isEmpty
+                ? "brew outdated exited with status \(status)."
+                : detail))
+        }
+        guard let data = out.data(using: .utf8) else {
+            return .failure(CheckFailure(message: "brew produced unreadable output."))
         }
 
-        guard let parsed = try? JSONDecoder().decode(OutdatedJSON.self, from: data) else {
-            return []
+        struct OutdatedJSON: Decodable {
+            // brew has shipped installed_versions as both a bare string
+            // (casks, pre-6.x) and an array (6.x unified both kinds). Accept
+            // either so the next Homebrew schema tweak cannot silently break
+            // update detection again.
+            struct VersionList: Decodable {
+                let versions: [String]
+                init(from decoder: Decoder) throws {
+                    let c = try decoder.singleValueContainer()
+                    if let arr = try? c.decode([String].self) {
+                        versions = arr
+                    } else if let s = try? c.decode(String.self) {
+                        versions = [s]
+                    } else {
+                        versions = []
+                    }
+                }
+            }
+            struct Entry: Decodable {
+                let name: String
+                let installed_versions: VersionList?
+                let current_version: String?
+                let pinned: Bool?
+            }
+            let formulae: [Entry]
+            let casks: [Entry]
+        }
+
+        let parsed: OutdatedJSON
+        do {
+            parsed = try JSONDecoder().decode(OutdatedJSON.self, from: data)
+        } catch {
+            return .failure(CheckFailure(message: "could not parse brew's JSON output."))
         }
 
         var out_items: [OutdatedItem] = []
-        for f in parsed.formulae {
-            out_items.append(OutdatedItem(
-                kind: .formula,
-                name: f.name,
-                currentVersion: f.installed_versions?.last ?? "?",
-                newVersion: f.current_version ?? "?",
-                masId: nil
-            ))
+        for (kind, entries) in [(UpdateKind.formula, parsed.formulae), (.cask, parsed.casks)] {
+            for e in entries {
+                // Pinned entries are excluded: brew upgrade refuses to touch
+                // them, so listing them would only produce failed rows.
+                if e.pinned == true { continue }
+                out_items.append(OutdatedItem(
+                    kind: kind,
+                    name: e.name,
+                    currentVersion: e.installed_versions?.versions.last ?? "?",
+                    newVersion: e.current_version ?? "?",
+                    masId: nil
+                ))
+            }
         }
-        for c in parsed.casks {
-            out_items.append(OutdatedItem(
-                kind: .cask,
-                name: c.name,
-                currentVersion: c.installed_versions ?? "?",
-                newVersion: c.current_version ?? "?",
-                masId: nil
-            ))
-        }
-        return out_items
+        return .success(out_items)
     }
 
-    private func readMasOutdated(mas: String) async -> [OutdatedItem] {
-        let (_, out) = await CommandRunner.runOnce(executable: mas, args: ["outdated"])
-        var items: [OutdatedItem] = []
-        out.split(separator: "\n").forEach { line in
-            let trimmed = String(line).trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty else { return }
+    /// brew compares against its own install receipt, which goes stale for
+    /// casks that update themselves (auto_updates apps like browsers). Check
+    /// the app bundle actually on disk: rows already at the catalog version
+    /// are dropped, and stale "current version" labels are corrected.
+    ///
+    /// Casks that declare an .app artifact which is missing from disk are
+    /// apps the user has deleted outside brew — the receipt survives in the
+    /// Caskroom, so brew keeps offering "updates" that would actually
+    /// reinstall the app. Those are excluded and counted in `removedAppsSkipped`
+    /// so the exclusion stays visible.
+    private func verifyCasksOnDisk(brew: String,
+                                   items: [OutdatedItem]) async -> (items: [OutdatedItem], removedApps: [String]) {
+        let caskNames = items.filter { $0.kind == .cask }.map { $0.name }
+        guard !caskNames.isEmpty else { return (items, []) }
 
-            let parts = trimmed.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-            guard parts.count == 2, let _ = Int(parts[0]) else { return }
-            let id = String(parts[0])
-            let rest = String(parts[1])
+        let (status, out, _) = await CommandRunner.runOnce(
+            executable: brew,
+            args: ["info", "--cask", "--json=v2"] + caskNames,
+            timeoutSeconds: 120)
+        // Verification is an accuracy refinement; if it fails, keep brew's view.
+        guard status == 0, let data = out.data(using: .utf8) else { return (items, []) }
 
-            var name = rest
-            var current = "?"
-            var newVer = "?"
-            if let openParen = rest.lastIndex(of: "("),
-               let closeParen = rest.lastIndex(of: ")"),
-               openParen < closeParen {
-                name = String(rest[..<openParen]).trimmingCharacters(in: .whitespaces)
-                let inside = String(rest[rest.index(after: openParen)..<closeParen])
-                let arrow = inside.split(separator: "-", maxSplits: 1)
-                    .map { $0.replacingOccurrences(of: ">", with: "").trimmingCharacters(in: .whitespaces) }
-                if arrow.count == 2 {
-                    current = arrow[0]
-                    newVer = arrow[1]
+        struct InfoJSON: Decodable {
+            struct Cask: Decodable {
+                let token: String
+                let artifacts: [Artifact]?
+            }
+            // The artifacts array mixes shapes (strings, dicts of several
+            // kinds); tolerate anything that is not an {app: [names]} entry.
+            struct Artifact: Decodable {
+                let app: [String]?
+                enum CodingKeys: String, CodingKey { case app }
+                init(from decoder: Decoder) {
+                    let c = try? decoder.container(keyedBy: CodingKeys.self)
+                    app = try? c?.decode([String].self, forKey: .app)
                 }
             }
+            let casks: [Cask]
+        }
+        guard let parsed = try? JSONDecoder().decode(InfoJSON.self, from: data) else { return (items, []) }
+
+        var appNameByCask: [String: String] = [:]
+        for cask in parsed.casks {
+            if let appName = cask.artifacts?.compactMap({ $0.app }).flatMap({ $0 }).first {
+                appNameByCask[cask.token] = appName
+            }
+        }
+
+        func appBundlePath(appName: String) -> String? {
+            for dir in ["/Applications", NSHomeDirectory() + "/Applications"] {
+                let path = "\(dir)/\(appName)"
+                if FileManager.default.fileExists(atPath: path) { return path }
+            }
+            return nil
+        }
+
+        func diskVersion(appPath: String) -> String? {
+            let plist = "\(appPath)/Contents/Info.plist"
+            guard let d = NSDictionary(contentsOfFile: plist) else { return nil }
+            return d["CFBundleShortVersionString"] as? String
+        }
+
+        // Cask versions may carry a build suffix ("1.2.3,4567"); the app's
+        // CFBundleShortVersionString only ever holds the marketing part.
+        func marketing(_ v: String) -> String {
+            v.split(separator: ",").first.map(String.init) ?? v
+        }
+
+        var result: [OutdatedItem] = []
+        var removedApps: [String] = []
+        for item in items {
+            // Non-casks, and pkg/CLI casks with no .app artifact: keep brew's view.
+            guard item.kind == .cask, let appName = appNameByCask[item.name] else {
+                result.append(item)
+                continue
+            }
+            guard let appPath = appBundlePath(appName: appName) else {
+                // Declared .app is gone from disk — the user deleted this app.
+                // "Updating" it would reinstall it, so exclude it.
+                removedApps.append(item.name)
+                continue
+            }
+            guard let disk = diskVersion(appPath: appPath) else {
+                result.append(item)   // present but unreadable: keep brew's view
+                continue
+            }
+            if marketing(item.newVersion) == disk {
+                continue  // app self-updated; only brew's receipt is behind
+            }
+            if marketing(item.currentVersion) != disk {
+                result.append(OutdatedItem(
+                    kind: .cask,
+                    name: item.name,
+                    currentVersion: disk,
+                    newVersion: item.newVersion,
+                    masId: nil
+                ))
+            } else {
+                result.append(item)
+            }
+        }
+        return (result, removedApps)
+    }
+
+    private func readMasOutdated(mas: String) async -> Result<[OutdatedItem], CheckFailure> {
+        let (status, out, err) = await CommandRunner.runOnce(
+            executable: mas, args: ["outdated"], timeoutSeconds: 60)
+        guard status == 0 else {
+            return .failure(CheckFailure(message: errTail(err)))
+        }
+
+        // Lines look like: "1435957248  Drafts  (53.0 -> 53.1)".
+        // Anchor on the trailing "(x -> y)" so hyphenated versions and app
+        // names containing parentheses parse correctly.
+        let pattern = #"^\s*(\d+)\s+(.+?)\s+\((.+) -> (.+)\)\s*$"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else {
+            return .success([])
+        }
+
+        var items: [OutdatedItem] = []
+        for line in out.split(separator: "\n") {
+            let s = String(line)
+            let range = NSRange(s.startIndex..., in: s)
+            guard let m = re.firstMatch(in: s, range: range),
+                  let idR = Range(m.range(at: 1), in: s),
+                  let nameR = Range(m.range(at: 2), in: s),
+                  let curR = Range(m.range(at: 3), in: s),
+                  let newR = Range(m.range(at: 4), in: s) else { continue }
             items.append(OutdatedItem(
                 kind: .mas,
-                name: name,
-                currentVersion: current,
-                newVersion: newVer,
-                masId: id
+                name: String(s[nameR]).trimmingCharacters(in: .whitespaces),
+                currentVersion: String(s[curR]),
+                newVersion: String(s[newR]),
+                masId: String(s[idR])
             ))
         }
-        return items
+        return .success(items)
     }
 
     // MARK: Log + accessibility

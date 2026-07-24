@@ -46,7 +46,7 @@ final class UpdateChecker: ObservableObject {
                 element: NSApp as Any,
                 notification: .announcementRequested,
                 userInfo: [
-                    .announcement: "ACleaner \(latest) is available. A Download Update button has appeared at the top of the window.",
+                    .announcement: "ACleaner \(latest) is available. An Update Now button has appeared at the top of the window. It installs the update without opening a browser.",
                     .priority: NSAccessibilityPriorityLevel.high.rawValue
                 ]
             )

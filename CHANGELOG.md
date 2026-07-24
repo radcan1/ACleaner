@@ -2,6 +2,188 @@
 
 All notable changes to ACleaner are documented in this file.
 
+## 2026-07-24 — One-click Cleanup, streamlined Uninstall, 5-section sidebar
+
+### Added
+
+**Cleanup: one click, no thinking**
+
+New sidebar section replacing both "Brew Cleanup" and "AI Cleanup". One
+Clean Now button covers only things that regenerate automatically: Homebrew
+junk (cleanup --prune=all), unused dependencies, records of deleted apps,
+AI caches (Claude app/GPU caches, VM warm cache, CLI temp), app & browser
+caches (~/Library/Caches), logs, developer caches (DerivedData, iOS
+DeviceSupport, simulator caches), and .DS_Store litter. Sizes estimate in
+the background on open ("Clean Now — 29 GB reclaimable"); a collapsed
+"What this cleans" disclosure shows the per-category breakdown without
+requiring review. Anything needing a decision stays out by design.
+
+**Disk Space now finds LLM models and Claude data (review-based)**
+
+Restores the hidden LLM Scanner's coverage as known locations: Ollama,
+LM Studio, Hugging Face cache, Jan, GPT4All, Meetily, Aiko, and Apple
+Whisper Transcription models — plus Claude agent/cowork sessions, Claude
+Code project transcripts, and the VM sandbox bundle. All review-then-trash,
+never auto-cleaned.
+
+### Changed
+
+**Uninstall: 7 interactions down to 2–3**
+
+The idle screen now embeds a searchable installed-apps list — no picker
+sheet, no "Move to Trash & Scan?" confirmation (trashing is reversible by
+design; the only surviving dialog is Quit & Uninstall for running apps).
+Scanning starts automatically after trashing and on Trash-watcher
+detections (scanning is read-only, so it never needs permission — the
+question moved to the only destructive step). Results land with VoiceOver
+focus on "Remove N leftovers (size)" so one Return press finishes; the
+Done screen is gone — completion is announced and the flow returns to the
+list, with failures surfaced in an alert and the summary in recent events.
+
+Sidebar is now 5 sections: Updates, Uninstall, Cleanup, Disk Space,
+Startup (Cmd-1…5).
+
+## 2026-07-24 — VoiceOver-accessible sudo prompt
+
+### Fixed
+
+**Password prompt for pkg-based cask updates was unreachable with VoiceOver**
+
+The old flow showed a custom NSAlert with an embedded secure text field,
+modal over the upgrade progress sheet — the alert could sit behind the
+sheet and the field never received VoiceOver focus, so it sounded like
+there was "no place to enter the password." Replaced with the Applite
+pattern: SUDO_ASKPASS now points to a helper that shows the NATIVE macOS
+password dialog (always frontmost, fully VoiceOver-accessible) whenever
+sudo needs a password. sudo retries the dialog up to 3 times on a wrong
+password, an announcement warns before the dialog appears, and the
+password is never written to disk (the old approach stored it in a temp
+file; now it flows dialog → sudo only).
+
+## 2026-07-22 — In-app self-update, version bump to 1.2.0
+
+### Added
+
+**Update Now: one-click in-app updates, no browser**
+
+The update banner's "Download Update" button used to open the GitHub
+releases page. It is now "Update Now" and does the whole job in-app
+(SelfUpdater.swift, Pearcleaner-style): resolves the latest release's .zip
+asset via the GitHub API, stream-downloads it with percentage progress
+(VoiceOver milestones at 25/50/75%, no spinner), unpacks with `ditto -xk`
+(preserves the code signature, so Full Disk Access persists), validates the
+bundle ID and verifies the signature, strips quarantine so Gatekeeper
+allows the relaunch, moves the old app to the Trash (reversible), installs
+the new copy, and relaunches. On failure the banner shows the error with
+Retry and an Open GitHub fallback. Pipeline mechanics verified end-to-end
+against a zip of the current build.
+
+### Fixed
+
+**"Update available" was offering a downgrade**
+
+build.sh stamped every build 1.0 and never changed, so the launch banner
+compared 1.0 against GitHub's v1.1.0 (July 11) and offered an "update" that
+was older than the installed code. Version is now 1.2.0; publish releases
+with a matching bumped tag and an ACleaner.zip asset (create it with
+`ditto -ck --keepParent` to preserve the signature) for Update Now to work.
+
+## 2026-07-22 — Extensive simplification: 13 screens → 6 flat sections
+
+### Changed
+
+**One flat sidebar, no nested tab bars, Cmd-1…6 shortcuts**
+
+The app was 13 screens across two navigation levels (Disk Detective alone
+hid 7 sub-tabs behind a segmented picker; Updater hid 3 more). Segmented
+controls buried features from VoiceOver users — finding "Maintenance" meant
+locating an unlabeled "View selector" two levels deep.
+
+New structure — every job is one sidebar item, one linear screen, one
+primary action, reachable directly via Cmd-1 through Cmd-6:
+
+1. Updates      — check and install updates (was Updater → Updates)
+2. Uninstall    — remove an app and its leftovers (was Clean Uninstall)
+3. Disk Space   — what's eating the disk (was Disk Detective → Disk Scan)
+4. AI Cleanup   — Claude/AI cruft (was Disk Detective → Claude)
+5. Brew Cleanup — old versions, unused deps, records of deleted apps
+                  (was Updater → Maintenance, now findable)
+6. Startup      — login items (was Startup Manager)
+
+Removed from the UI (code retained, restorable on request): Install (app
+installer inside a cleaner), Browse, Time Machine, App Cleaner (duplicated
+Uninstall's job), Orphans, History, LLM Scanner (overlapped AI Cleanup),
+and both nested tab bars. Stale-cask section renamed "Records of deleted
+apps" in plain language.
+
+## 2026-07-20 — Reliable update detection
+
+### Added
+
+**Homebrew receipt sync on uninstall (ghost prevention)**
+
+Deleting a brew-installed app without `brew uninstall` leaves its receipt in
+the Caskroom, so brew keeps offering "updates" that would reinstall the
+deleted app. Clean Uninstall now closes that loop: when a cleanup commits,
+`BrewReceipts` maps the app name to its installed cask token (tolerating
+Finder's " 2" rename counters) and runs `brew uninstall --cask --force` to
+purge the receipt. Silent for apps brew doesn't manage; announced via
+VoiceOver when a receipt is removed. The Trash copy of the app is untouched.
+
+Defense in depth for ghosts that predate this or slip through:
+the Updater excludes casks whose declared .app is missing from disk (with a
+visible "N deleted apps ignored" note), and Maintenance's stale-cask scan
+removes leftover receipts permanently. Known limitation: pkg-based casks
+(Microsoft Office, Zoom) declare no .app artifact and cannot be auto-matched
+on uninstall — Maintenance remains the cleanup path for those.
+
+### Fixed
+
+**"No updates available" while dozens of updates existed**
+
+Two root causes, both silent:
+
+1. Homebrew 6.x changed the `brew outdated --json=v2` schema — casks'
+   `installed_versions` became an array where the decoder expected a string —
+   so JSON decoding threw on every check, and the `try?` swallowed it into an
+   empty list indistinguishable from "everything is up to date". The decoder
+   now accepts both shapes (`VersionList`), so the next brew schema tweak
+   cannot silently break detection again.
+2. `CommandRunner.runOnce` merged stdout and stderr into one pipe, letting
+   brew's stderr chatter (update banners, tap messages, warnings) corrupt the
+   JSON payload unpredictably. stdout and stderr are now separate; parsers
+   only ever see stdout. This also cleaned up latent parsing hazards in
+   install search, installed-set refresh, and maintenance scans.
+
+**Failures no longer masquerade as success**
+
+Any non-zero exit or parse failure from `brew outdated` now surfaces as
+"Update check failed: …" in the header (and via VoiceOver) instead of a clean
+empty list. `brew update` or `mas outdated` problems produce a visible warning
+while still showing the results that could be collected. Every check command
+has a timeout (SIGTERM, then SIGKILL), so a hung network can no longer leave
+the app stuck on "Checking…" forever.
+
+**False positives from self-updating apps**
+
+brew compares against its install receipt, which goes stale for auto-updating
+casks (browsers, Dropbox, 1Password…). Outdated casks are now verified against
+the app bundle's actual `CFBundleShortVersionString` on disk: rows already at
+the catalog version are dropped, stale "current version" labels are corrected,
+and pkg-based casks without an `.app` artifact safely keep brew's view.
+Pinned formulae are excluded since `brew upgrade` refuses to touch them.
+
+**Robust `mas outdated` parsing**
+
+The version range is now parsed by anchoring on the trailing `(x -> y)`
+pattern, so hyphenated versions ("1.2-beta") and app names containing
+parentheses no longer mis-parse.
+
+### Changed
+
+- `runOnce` executes off the calling thread; previously it blocked the main
+  actor for the duration of `brew update`, freezing the UI during a check.
+
 ## 2026-07-07 — Scan freeze fix, single-pass dev scan, accurate app usage dates, stable signing
 
 ### Fixed

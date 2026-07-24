@@ -2,10 +2,6 @@ import SwiftUI
 
 struct MainView: View {
     @EnvironmentObject var state: AppState
-    // ── App picker lives here, not in IdleView ────────────────────────────────
-    // Keeping the sheet on this view (which is always in the hierarchy) prevents
-    // it from being torn down when the phase switches from .idle to .detected.
-    @State private var showAppPicker = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -15,12 +11,6 @@ struct MainView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .padding()
-        // Sheet is owned by MainView so it survives the .idle → .detected transition
-        .sheet(isPresented: $showAppPicker) {
-            AppPickerSheet { appURL in
-                state.trashAndScan(appURL: appURL)
-            }
-        }
         // Error alert — populated by AppState when the trash operation fails
         .alert("Could Not Uninstall App", isPresented: Binding(
             get:  { state.trashingError != nil },
@@ -36,7 +26,7 @@ struct MainView: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
-            Text("Clean Uninstall")
+            Text("Uninstall")
                 .font(.title)
                 .accessibilityAddTraits(.isHeader)
             Spacer()
@@ -61,19 +51,15 @@ struct MainView: View {
     private var content: some View {
         switch state.phase {
         case .idle:
-            IdleView(showAppPicker: $showAppPicker)
+            IdleView()
         case .trashing(let name):
             ProgressMessageView(message: "Moving \"\(name)\" to the Trash\u{2026}")
-        case .detected(let app):
-            DetectionView(app: app)
         case .scanning(let app):
             ScanningView(app: app)
         case .results(let app, let files):
             ResultsView(app: app, files: files)
         case .cleaning:
             ProgressMessageView(message: "Moving items to the Trash. Please wait.")
-        case .done(let app, let removed, let failed):
-            DoneView(app: app, removed: removed, failed: failed)
         }
     }
 }
@@ -82,7 +68,6 @@ struct MainView: View {
 
 struct IdleView: View {
     @EnvironmentObject var state: AppState
-    @Binding var showAppPicker: Bool
 
     var body: some View {
         ScrollView {
@@ -135,21 +120,19 @@ struct IdleView: View {
                     Divider()
                 }
 
-                // ── Direct uninstall ──────────────────────────────────────
+                // ── Direct uninstall: inline searchable list, no sheet ─────
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Uninstall an App")
                         .font(.headline)
                         .accessibilityAddTraits(.isHeader)
-                    Text("Select any installed application and ACleaner will move it to the Trash then scan for its leftover files — no dragging required.")
+                    Text("Press an app to move it to the Trash and scan for its leftover files. Everything goes to the Trash — recoverable until you empty it.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Button("Choose App to Uninstall\u{2026}") {
-                        showAppPicker = true
+                    InlineAppPicker { appURL in
+                        state.trashAndScan(appURL: appURL)
                     }
-                    .controlSize(.large)
-                    .keyboardShortcut("u", modifiers: .command)
-                    .accessibilityHint("Opens a searchable list of installed apps. Press Enter on an app to move it to the Trash and scan for leftovers. Shortcut: Command-U.")
+                    .frame(minHeight: 260)
                 }
                 .padding(14)
                 .background(Color(nsColor: .controlBackgroundColor))
@@ -270,6 +253,7 @@ struct ResultsView: View {
     let app: TrashedApp
     let files: [LeftoverFile]
     @EnvironmentObject var state: AppState
+    @AccessibilityFocusState private var focusRemoveButton: Bool
 
     private var totalBytes: Int64 {
         files.filter { state.selection.contains($0.url) }
@@ -334,18 +318,31 @@ struct ResultsView: View {
             .accessibilityLabel("Leftover files. \(files.count) items.")
 
             HStack(spacing: 12) {
-                Button("Move selected to Trash") {
+                Button(removeButtonTitle) {
                     state.performCleanup(app, items: files)
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(state.selection.isEmpty)
-                .accessibilityHint("Moves the selected items to the Trash.")
+                .accessibilityFocused($focusRemoveButton)
+                .accessibilityHint("Moves the selected leftovers to the Trash. Press Return to confirm.")
 
-                Button("Cancel") { state.resetToIdle() }
+                Button("Keep leftovers") { state.resetToIdle() }
                     .keyboardShortcut(.cancelAction)
-                    .accessibilityHint("Closes the results without removing anything.")
+                    .accessibilityHint("Leaves all files in place and returns to the app list.")
             }
         }
+        .onAppear {
+            // Land VoiceOver on the primary action: one Return press finishes
+            // the uninstall. The review list stays available above it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                focusRemoveButton = true
+            }
+        }
+    }
+
+    private var removeButtonTitle: String {
+        let size = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        return "Remove \(state.selection.count) leftover\(state.selection.count == 1 ? "" : "s") (\(size))"
     }
 }
 

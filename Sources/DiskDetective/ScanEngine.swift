@@ -299,6 +299,82 @@ class ScanEngine: ObservableObject {
              "\(home)/Library/Caches",
              .deleteDirectory),
 
+            // ── Local language models: deliberate installs, review before
+            //    deleting. Re-download from the source app to restore. ──────
+            ("LLM Models",
+             "Ollama models",
+             "Local language models — re-download with ollama pull if needed",
+             "\(home)/.ollama/models",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "LM Studio models",
+             "Local language models — re-download in LM Studio if needed",
+             "\(home)/.cache/lm-studio/models",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "LM Studio models (Application Support)",
+             "Local language models — re-download in LM Studio if needed",
+             "\(home)/Library/Application Support/LM Studio/models",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "Hugging Face cache",
+             "Downloaded models and datasets — re-downloaded on next use",
+             "\(home)/.cache/huggingface",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "Jan models",
+             "Local language models — re-download in Jan if needed",
+             "\(home)/jan/models",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "GPT4All models",
+             "Local language models — re-download in GPT4All if needed",
+             "\(home)/Library/Application Support/nomic.ai/GPT4All",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "Meetily models",
+             "Local Whisper models — re-downloaded by Meetily if needed",
+             "\(home)/Library/Application Support/com.meetily.ai/models",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "Aiko models",
+             "Local transcription models — re-downloaded by Aiko if needed",
+             "\(home)/Library/Application Support/co.apptorium.Aiko",
+             .deleteDirectory),
+
+            ("LLM Models",
+             "Whisper Transcription models",
+             "Local transcription models — re-downloaded on next use",
+             "\(home)/Library/Application Support/com.apple.whispertranscription",
+             .deleteDirectory),
+
+            // ── Claude data that needs review (NOT in one-click Cleanup:
+            //    sessions and transcripts are your data, not cache). ────────
+            ("AI Data",
+             "Claude agent & cowork sessions",
+             "Saved agent session data — review before deleting",
+             "\(home)/Library/Application Support/Claude/local-agent-mode-sessions",
+             .deleteDirectory),
+
+            ("AI Data",
+             "Claude Code project transcripts",
+             "Conversation history for Claude Code projects — review before deleting",
+             "\(home)/.claude/projects",
+             .deleteDirectory),
+
+            ("AI Data",
+             "Claude VM sandbox bundle",
+             "Claude Code virtual machine — rebuilt automatically, a few minutes on next use",
+             "\(home)/Library/Application Support/Claude/vm_bundles/claudevm.bundle",
+             .deleteDirectory),
+
             ("Logs",
              "User Log Files",
              "Application log files — safe to delete",

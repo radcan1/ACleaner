@@ -6,31 +6,88 @@ import Foundation
 
 enum CommandRunner {
 
-    /// Run a command and collect the full stdout+stderr.
+    /// Exit status reported when a command was killed by `timeoutSeconds`.
+    static let timeoutStatus: Int32 = 124
+
+    /// Run a command and collect stdout and stderr separately.
+    ///
+    /// Parsers must only ever consume `out`: brew freely writes banners,
+    /// warnings, and tap chatter to stderr, and mixing the two streams is
+    /// what used to corrupt the `brew outdated --json=v2` payload and make
+    /// update detection fail silently.
+    ///
+    /// The subprocess and blocking reads run on a background queue so the
+    /// caller's thread (often the main actor) is never blocked. A non-nil
+    /// `timeoutSeconds` terminates a hung process (SIGTERM, then SIGKILL
+    /// after 5 s) and reports `timeoutStatus`.
     @discardableResult
     static func runOnce(executable: String,
                         args: [String],
-                        extraEnv: [String: String] = [:]) async -> (status: Int32, out: String) {
-        await withCheckedContinuation { (continuation: CheckedContinuation<(Int32, String), Never>) in
-            let proc = Process()
-            proc.executableURL = URL(fileURLWithPath: executable)
-            proc.arguments = args
-            proc.environment = brewEnv(adding: extraEnv)
+                        extraEnv: [String: String] = [:],
+                        timeoutSeconds: Double? = nil) async -> (status: Int32, out: String, err: String) {
+        await withCheckedContinuation { (continuation: CheckedContinuation<(Int32, String, String), Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: executable)
+                proc.arguments = args
+                proc.environment = brewEnv(adding: extraEnv)
 
-            let pipe = Pipe()
-            proc.standardOutput = pipe
-            proc.standardError = pipe
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                proc.standardOutput = outPipe
+                proc.standardError = errPipe
 
-            do {
-                try proc.run()
-            } catch {
-                continuation.resume(returning: (1, ""))
-                return
+                do {
+                    try proc.run()
+                } catch {
+                    continuation.resume(returning: (1, "", "failed to launch \(executable): \(error.localizedDescription)"))
+                    return
+                }
+
+                let timedOut = TimeoutFlag()
+                var timeoutWork: DispatchWorkItem?
+                if let t = timeoutSeconds {
+                    let pid = proc.processIdentifier
+                    let work = DispatchWorkItem {
+                        guard proc.isRunning else { return }
+                        timedOut.set()
+                        proc.terminate()
+                        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+                            if proc.isRunning { kill(pid, SIGKILL) }
+                        }
+                    }
+                    timeoutWork = work
+                    DispatchQueue.global().asyncAfter(deadline: .now() + t, execute: work)
+                }
+
+                // Drain both pipes concurrently — reading them sequentially can
+                // deadlock when the unread pipe's buffer fills.
+                var outData = Data()
+                var errData = Data()
+                let group = DispatchGroup()
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+                group.enter()
+                DispatchQueue.global(qos: .userInitiated).async {
+                    errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    group.leave()
+                }
+                group.wait()
+                proc.waitUntilExit()
+                timeoutWork?.cancel()
+
+                let out = String(data: outData, encoding: .utf8) ?? ""
+                var err = String(data: errData, encoding: .utf8) ?? ""
+                var status = proc.terminationStatus
+                if timedOut.isSet {
+                    status = timeoutStatus
+                    err += (err.isEmpty ? "" : "\n") + "timed out after \(Int(timeoutSeconds ?? 0)) seconds"
+                }
+                continuation.resume(returning: (status, out, err))
             }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            let s = String(data: data, encoding: .utf8) ?? ""
-            continuation.resume(returning: (proc.terminationStatus, s))
         }
     }
 
@@ -84,6 +141,7 @@ enum CommandRunner {
         var env = ProcessInfo.processInfo.environment
         env["HOMEBREW_NO_EMOJI"] = "1"
         env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+        env["HOMEBREW_NO_ENV_HINTS"] = "1"
         for (k, v) in extra { env[k] = v }
         return env
     }
@@ -163,7 +221,7 @@ enum CommandRunner {
         }
 
         // osascript blocks until the shell command finishes (or auth fails).
-        let (osaStatus, osaErr) = await runOnce(
+        let (osaStatus, _, osaErr) = await runOnce(
             executable: "/usr/bin/osascript",
             args: ["-e", appleScript]
         )
@@ -231,6 +289,14 @@ enum CommandRunner {
         s.replacingOccurrences(of: "\\", with: "\\\\")
          .replacingOccurrences(of: "\"", with: "\\\"")
     }
+}
+
+/// Thread-safe latch for the runOnce timeout path.
+final class TimeoutFlag {
+    private let lock = NSLock()
+    private var value = false
+    func set() { lock.lock(); value = true; lock.unlock() }
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
 }
 
 // MARK: - Line buffering

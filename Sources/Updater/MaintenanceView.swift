@@ -1,6 +1,13 @@
 import SwiftUI
 import AppKit
 
+/// Standalone host so Brew Cleanup can live as its own sidebar section,
+/// owning its engine for the lifetime of the app.
+struct BrewCleanupHostView: View {
+    @StateObject private var engine = MaintenanceEngine()
+    var body: some View { MaintenanceView(engine: engine) }
+}
+
 struct MaintenanceView: View {
     @ObservedObject var engine: MaintenanceEngine
 
@@ -8,9 +15,9 @@ struct MaintenanceView: View {
 
     private var sections: [(label: String, kind: CleanupCandidate.Kind)] {
         [
-            ("Old versions (brew cleanup)", .oldVersion),
-            ("Unused dependencies (brew autoremove)", .orphanedFormula),
-            ("Stale casks (.app missing from /Applications)", .staleCask)
+            ("Old versions", .oldVersion),
+            ("Unused dependencies", .orphanedFormula),
+            ("Records of deleted apps", .staleCask)
         ]
     }
 
@@ -42,7 +49,7 @@ struct MaintenanceView: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("Maintenance")
+                Text("Brew Cleanup")
                     .font(.headline)
                 Group {
                     if engine.state == .scanning {
@@ -52,7 +59,7 @@ struct MaintenanceView: View {
                     } else if case .done(let n, let b) = engine.state {
                         Text("Removed \(n) item\(n == 1 ? "" : "s"). Freed \(MaintenanceEngine.formatBytes(b)).")
                     } else {
-                        Text("Click Scan to find old versions, unused dependencies, and stale casks.")
+                        Text("Click Scan to find old versions, unused dependencies, and records of deleted apps.")
                     }
                 }
                 .font(.caption)

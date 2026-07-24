@@ -89,7 +89,7 @@ final class MaintenanceEngine: ObservableObject {
     /// Parse `brew cleanup --dry-run` output.
     /// Returns the list of removable items and the total freeable bytes.
     private func scanCleanup(brew: String) async -> (items: [CleanupCandidate], totalBytes: Int64) {
-        let (_, out) = await CommandRunner.runOnce(executable: brew,
+        let (_, out, _) = await CommandRunner.runOnce(executable: brew,
                                                    args: ["cleanup", "--dry-run"])
         var items: [CleanupCandidate] = []
         var total: Int64 = 0
@@ -173,7 +173,7 @@ final class MaintenanceEngine: ObservableObject {
     }
 
     private func scanAutoremove(brew: String) async -> [CleanupCandidate] {
-        let (_, out) = await CommandRunner.runOnce(executable: brew,
+        let (_, out, _) = await CommandRunner.runOnce(executable: brew,
                                                    args: ["autoremove", "--dry-run"])
         // brew autoremove --dry-run output formats vary across versions. Two
         // shapes we handle:
@@ -223,7 +223,7 @@ final class MaintenanceEngine: ObservableObject {
     /// expected place. Uses `brew info --json=v2 --installed --cask` once,
     /// then file-system-checks each artifact.
     private func scanStaleCasks(brew: String) async -> [CleanupCandidate] {
-        let (_, out) = await CommandRunner.runOnce(
+        let (_, out, _) = await CommandRunner.runOnce(
             executable: brew,
             args: ["info", "--json=v2", "--installed", "--cask"]
         )

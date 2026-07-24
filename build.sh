@@ -26,10 +26,14 @@ swiftc \
   "$SCRIPT_DIR/Sources/Shared/ScanCache.swift" \
   "$SCRIPT_DIR/Sources/Shared/AppTokenMatcher.swift" \
   "$SCRIPT_DIR/Sources/Shared/ExclusionStore.swift" \
+  "$SCRIPT_DIR/Sources/Shared/BrewReceipts.swift" \
   \
   "$SCRIPT_DIR/Sources/main.swift" \
   "$SCRIPT_DIR/Sources/RootView.swift" \
   "$SCRIPT_DIR/Sources/UpdateChecker.swift" \
+  "$SCRIPT_DIR/Sources/SelfUpdater.swift" \
+  "$SCRIPT_DIR/Sources/Cleanup/CleanupEngine.swift" \
+  "$SCRIPT_DIR/Sources/Cleanup/CleanupView.swift" \
   "$SCRIPT_DIR/Sources/PermissionsChecker.swift" \
   "$SCRIPT_DIR/Sources/PermissionsView.swift" \
   \
@@ -98,9 +102,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'PLIST'
     <key>CFBundleIdentifier</key>
     <string>com.user.ACleaner</string>
     <key>CFBundleVersion</key>
-    <string>1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.2.0</string>
     <key>CFBundleExecutable</key>
     <string>ACleaner</string>
     <key>CFBundlePackageType</key>

@@ -1,93 +1,42 @@
 import SwiftUI
 import AppKit
 
-enum UpdaterTab: String, CaseIterable, Identifiable {
-    case updates, install, maintenance
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .updates:     return "Updates"
-        case .install:     return "Install"
-        case .maintenance: return "Maintenance"
-        }
-    }
-
-    var systemImage: String {
-        switch self {
-        case .updates:     return "arrow.down.circle"
-        case .install:     return "plus.app"
-        case .maintenance: return "wand.and.sparkles"
-        }
-    }
-}
-
+// One screen, one job: check for updates and install them. The old
+// Install and Maintenance sub-tabs are gone — Brew Cleanup is its own
+// sidebar section now, and the segmented "View selector" no longer exists.
 struct UpdaterView: View {
     @StateObject private var skipList: SkipList
     @StateObject private var updateEngine: UpdateEngine
-    @StateObject private var installEngine: InstallEngine
-    @StateObject private var maintenanceEngine: MaintenanceEngine
 
-    @State private var tab: UpdaterTab = .updates
     @State private var showSkipped = false
 
     init() {
         let sl = SkipList()
         _skipList = StateObject(wrappedValue: sl)
         _updateEngine = StateObject(wrappedValue: UpdateEngine(skipList: sl))
-        _installEngine = StateObject(wrappedValue: InstallEngine())
-        _maintenanceEngine = StateObject(wrappedValue: MaintenanceEngine())
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            tabBar
+            HStack {
+                Spacer()
+                Button {
+                    showSkipped = true
+                } label: {
+                    Label("Skipped (\(skipList.entries.count))", systemImage: "nosign")
+                }
+                .buttonStyle(.borderless)
+                .help("View the list of apps you have chosen to skip.")
+                .accessibilityLabel("View skipped apps. \(skipList.entries.count) currently skipped.")
+            }
+            .padding(.horizontal, 16).padding(.vertical, 8)
             Divider()
-            currentView
+            UpdatesView(engine: updateEngine, skipList: skipList)
         }
         .sheet(isPresented: $showSkipped) {
             SkippedAppsSheet(skipList: skipList) {
                 Task { await updateEngine.reapplySkipFilter() }
             }
-        }
-    }
-
-    @ViewBuilder
-    private var tabBar: some View {
-        HStack(spacing: 12) {
-            Picker("View", selection: $tab) {
-                ForEach(UpdaterTab.allCases) { t in
-                    Label(t.label, systemImage: t.systemImage).tag(t)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 420)
-            .accessibilityLabel("View selector")
-
-            Spacer()
-
-            Button {
-                showSkipped = true
-            } label: {
-                Label("Skipped (\(skipList.entries.count))", systemImage: "nosign")
-            }
-            .buttonStyle(.borderless)
-            .help("View the list of apps you have chosen to skip.")
-            .accessibilityLabel("View skipped apps. \(skipList.entries.count) currently skipped.")
-        }
-        .padding(.horizontal, 16).padding(.vertical, 8)
-    }
-
-    @ViewBuilder
-    private var currentView: some View {
-        switch tab {
-        case .updates:
-            UpdatesView(engine: updateEngine, skipList: skipList)
-        case .install:
-            InstallView(engine: installEngine)
-        case .maintenance:
-            MaintenanceView(engine: maintenanceEngine)
         }
     }
 }
@@ -151,11 +100,17 @@ struct UpdatesView: View {
                     if engine.state == .checking {
                         Text(engine.checkStatus)
                     } else if engine.state == .ready {
-                        Text(summaryText)
+                        Text(engine.warningNote.isEmpty
+                            ? summaryText
+                            : "\(summaryText) \(engine.warningNote)")
                     } else if case .done(let s, let f) = engine.state {
                         Text("Last run: \(s) succeeded, \(f) failed.")
                     } else {
-                        Text("Click Check for Updates to scan Homebrew and the App Store.")
+                        // idle also carries error text ("Update check failed: …",
+                        // "Homebrew not found…") in checkStatus.
+                        Text(engine.checkStatus.isEmpty
+                            ? "Click Check for Updates to scan Homebrew and the App Store."
+                            : engine.checkStatus)
                     }
                 }
                 .font(.caption)

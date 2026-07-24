@@ -90,7 +90,7 @@ final class InstallEngine: ObservableObject {
         // brew search has surprisingly strict regex/substring match. Use brew
         // search first; if empty, fall back to a subsequence scan against the
         // full catalog.
-        let (_, out) = await CommandRunner.runOnce(executable: brew, args: ["search", flag, query])
+        let (_, out, _) = await CommandRunner.runOnce(executable: brew, args: ["search", flag, query])
         var names = out
             .split(separator: "\n")
             .map { String($0).trimmingCharacters(in: .whitespaces) }
@@ -119,7 +119,7 @@ final class InstallEngine: ObservableObject {
         let normQ = normalize(query)
         guard !normQ.isEmpty else { return [] }
 
-        let (_, out) = await CommandRunner.runOnce(executable: brew, args: [catalog])
+        let (_, out, _) = await CommandRunner.runOnce(executable: brew, args: [catalog])
         let candidates = out.split(separator: "\n").map { String($0) }
 
         var hits: [(Int, String)] = []
@@ -136,7 +136,7 @@ final class InstallEngine: ObservableObject {
     }
 
     private func searchMas(mas: String, query: String) async -> [SearchResult] {
-        let (_, out) = await CommandRunner.runOnce(executable: mas, args: ["search", query])
+        let (_, out, _) = await CommandRunner.runOnce(executable: mas, args: ["search", query])
         var results: [SearchResult] = []
         for line in out.split(separator: "\n") {
             // Lines look like:    "1435957248  Drafts  (52.0.1)"
@@ -164,14 +164,14 @@ final class InstallEngine: ObservableObject {
     }
 
     private func refreshInstalledSets(brew: String) async {
-        let (_, casks) = await CommandRunner.runOnce(executable: brew, args: ["list", "--cask"])
+        let (_, casks, _) = await CommandRunner.runOnce(executable: brew, args: ["list", "--cask"])
         installedCasks = Set(casks.split(separator: "\n").map { String($0) })
 
-        let (_, formulae) = await CommandRunner.runOnce(executable: brew, args: ["list", "--formula"])
+        let (_, formulae, _) = await CommandRunner.runOnce(executable: brew, args: ["list", "--formula"])
         installedFormulae = Set(formulae.split(separator: "\n").map { String($0) })
 
         if let mas = CommandRunner.masPath {
-            let (_, listed) = await CommandRunner.runOnce(executable: mas, args: ["list"])
+            let (_, listed, _) = await CommandRunner.runOnce(executable: mas, args: ["list"])
             installedMasIds = Set(listed.split(separator: "\n").compactMap { line in
                 String(line).trimmingCharacters(in: .whitespaces)
                     .split(separator: " ").first.map(String.init)

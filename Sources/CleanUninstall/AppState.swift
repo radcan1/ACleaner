@@ -9,14 +9,15 @@ extension Notification.Name {
 
 @MainActor
 final class AppState: ObservableObject {
+    // Streamlined: no .detected (scanning is read-only, so it never needs
+    // permission — we scan immediately and ask only at the destructive step)
+    // and no .done (cleanup announces its summary and returns to idle).
     enum Phase: Equatable {
         case idle
         case trashing(String)               // displayName — shown while password dialog is open
-        case detected(TrashedApp)
         case scanning(TrashedApp)
         case results(TrashedApp, [LeftoverFile])
         case cleaning
-        case done(app: TrashedApp, removed: Int, failed: [String])
     }
 
     @Published var phase: Phase = .idle
@@ -97,11 +98,13 @@ final class AppState: ObservableObject {
             recentEvents.insert("Detected \(trashed.displayName) in Trash", at: 0)
             if recentEvents.count > 20 { recentEvents.removeLast() }
 
-            phase = .detected(trashed)
+            // Scanning is read-only — run it immediately and ask the user
+            // only at the destructive step (removing leftovers).
             bringToFront()
             NotificationCenter.default.post(name: .acleanerShowCleanUninstall, object: nil)
             SoundPlayer.playDetected()
-            announce("Warning: \(trashed.displayName) was moved to the Trash. ACleaner has switched to Clean Uninstall — review and remove its leftover files.")
+            announce("\(trashed.displayName) was moved to the Trash. Scanning for leftover files.")
+            startScan(trashed)
         }
     }
 
@@ -142,14 +145,35 @@ final class AppState: ObservableObject {
         Task.detached(priority: .userInitiated) {
             let outcome = Cleaner.moveToTrash(urls: toRemove)
             await MainActor.run {
-                self.phase = .done(app: trashed, removed: outcome.removed, failed: outcome.failed)
-                self.selection = []
                 SoundPlayer.playCleanupComplete()
                 CleanupJournal.shared.record(label: "Clean Uninstall: \(trashed.displayName)", items: outcome.trashedPairs)
+                self.recentEvents.insert(
+                    "Cleaned \(trashed.displayName) — removed \(outcome.removed) item\(outcome.removed == 1 ? "" : "s")", at: 0)
+                if self.recentEvents.count > 20 { self.recentEvents.removeLast() }
                 let failedNote = outcome.failed.isEmpty
                     ? ""
                     : ". \(outcome.failed.count) item\(outcome.failed.count == 1 ? "" : "s") could not be removed."
                 self.announce("Cleanup finished. Removed \(outcome.removed) item\(outcome.removed == 1 ? "" : "s")\(failedNote)")
+                // No Done screen — summarize by voice and return to the list.
+                if !outcome.failed.isEmpty {
+                    self.trashingError = "Some items could not be removed:\n\n"
+                        + outcome.failed.joined(separator: "\n")
+                }
+                self.resetToIdle()
+            }
+
+            // The uninstall is committed — if Homebrew installed this app,
+            // purge its cask receipt so brew stops tracking (and "updating")
+            // an app that no longer exists. Silent when brew never knew it.
+            if let token = await BrewReceipts.caskToken(forAppNamed: trashed.originalName + ".app") {
+                let purged = await BrewReceipts.purgeReceipt(token: token)
+                await MainActor.run {
+                    if purged {
+                        self.recentEvents.insert("Removed Homebrew record for \(trashed.displayName)", at: 0)
+                        if self.recentEvents.count > 20 { self.recentEvents.removeLast() }
+                        self.announce("Homebrew record for \(trashed.displayName) removed.", priority: .medium)
+                    }
+                }
             }
         }
     }
@@ -179,14 +203,14 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Transitions directly to the detected phase for an app that is already in the Trash.
+    /// Scans an app that is already sitting in the Trash. Goes straight to
+    /// scanning — the scan is read-only, so no intermediate question.
     func scanExistingTrashedApp(_ app: TrashedApp) {
         markHandled(app.trashURL.path)           // prevent watcher double-firing
         recentEvents.insert("Detected \(app.displayName) in Trash", at: 0)
         if recentEvents.count > 20 { recentEvents.removeLast() }
-        phase = .detected(app)
         SoundPlayer.playDetected()
-        announce("\(app.displayName) is in the Trash. Ready to scan for leftover files.")
+        startScan(app)
     }
 
     // MARK: - Direct uninstall (user-initiated, no Trash drag needed)
@@ -291,9 +315,11 @@ final class AppState: ObservableObject {
             recentEvents.insert("Uninstalled \(trashed.displayName)", at: 0)
             if recentEvents.count > 20 { recentEvents.removeLast() }
 
-            phase = .detected(trashed)
+            // The user already committed by choosing the app — scan
+            // immediately instead of asking again.
             SoundPlayer.playDetected()
-            announce("Moved \(trashed.displayName) to the Trash. Press Scan for leftover files to continue.")
+            announce("Moved \(trashed.displayName) to the Trash. Scanning for leftover files.")
+            startScan(trashed)
         }
     }
 

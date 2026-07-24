@@ -3,41 +3,39 @@ import AppKit
 
 // Provides SUDO_ASKPASS to brew so cask .pkg installers can run without a tty.
 //
-// Approach:
-//   1. Show a native NSAlert with a secure text field. VoiceOver reads it.
-//   2. Write a small helper script that prints the password to stdout.
-//   3. Return {"SUDO_ASKPASS": helperPath} so subprocesses inherit it.
+// Approach (Applite-style): the askpass helper shows the NATIVE macOS
+// password dialog via osascript whenever sudo needs a password. Native
+// dialogs are always frontmost and fully VoiceOver-accessible — unlike the
+// previous custom NSAlert with an embedded secure field, which could sit
+// behind the upgrade sheet and never receive VoiceOver focus.
 //
-// On macOS sudo will invoke the SUDO_ASKPASS helper when no tty is available
-// (which is the case for a Process launched from a GUI app).
+// Security: the password is never stored anywhere. It flows dialog → stdout
+// → sudo and exists nowhere else. (The old approach wrote it to a temp
+// file; this one writes only the dialog script.)
 //
-// The helper is created with mode 0700 in a temp dir and removed on cleanup().
+// sudo re-invokes the helper up to 3 times on a wrong password, so typos
+// self-recover without any custom retry UI.
 
 enum Sudo {
     nonisolated(unsafe) private static var helperURL: URL?
 
-    /// Prompts the user for their password and writes an askpass helper.
-    /// Returns the env dict to merge into a child Process, or nil if the user
-    /// cancelled or the password could not be validated.
+    /// Writes the askpass helper and validates it once up-front (`sudo -A
+    /// true`), so the password dialog appears immediately — not mid-upgrade —
+    /// and sudo's timestamp is warmed for the casks that follow. Returns the
+    /// env dict to merge into child Processes, or nil if the user cancelled.
     @MainActor
     static func setupAskpass() async -> [String: String]? {
-        guard let pw = promptPassword() else { return nil }
-        guard let url = writeHelper(pw: pw) else { return nil }
+        guard let url = writeHelper() else { return nil }
         helperURL = url
-
-        // Validate the password against sudo so we fail fast rather than
-        // mid-upgrade.
         let env = ["SUDO_ASKPASS": url.path]
+
+        Announcer.announce(
+            "macOS will now ask for your Mac login password to allow installer-based updates. Press Cancel in the dialog to skip them.")
+
         let ok = await validateSudo(env: env)
         if !ok {
             cleanup()
-            await MainActor.run {
-                let alert = NSAlert()
-                alert.messageText = "Password not accepted"
-                alert.informativeText = "macOS rejected the password you entered. Pkg-based casks (Microsoft Office, OneDrive, etc.) will be skipped."
-                alert.alertStyle = .warning
-                alert.runModal()
-            }
+            Announcer.announce("No password provided. Installer-based updates will be skipped.")
             return nil
         }
         return env
@@ -58,39 +56,17 @@ enum Sudo {
 
     // MARK: - Internals
 
-    @MainActor
-    private static func promptPassword() -> String? {
-        let alert = NSAlert()
-        alert.messageText = "Mac Updater needs your password"
-        alert.informativeText = "Some Homebrew casks (Microsoft Office, OneDrive, etc.) ship .pkg installers that require sudo. Your password stays local — it is written to a temporary file readable only by you and is removed when the update finishes.\n\nCancel to skip those casks."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Skip")
-
-        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "Mac login password"
-        field.setAccessibilityLabel("Mac login password")
-        alert.accessoryView = field
-
-        // Move focus to the password field after the alert lays out.
-        DispatchQueue.main.async {
-            alert.window.initialFirstResponder = field
-            field.window?.makeFirstResponder(field)
-        }
-
-        let response = alert.runModal()
-        guard response == .alertFirstButtonReturn else { return nil }
-        let pw = field.stringValue
-        return pw.isEmpty ? nil : pw
-    }
-
-    private static func writeHelper(pw: String) -> URL? {
+    /// The helper contains no secrets — just the script that shows the
+    /// native dialog and prints what the user typed.
+    private static func writeHelper() -> URL? {
         let dir = FileManager.default.temporaryDirectory
-        let url = dir.appendingPathComponent("macupdater-askpass-\(UUID().uuidString).sh")
-        // The helper just prints the password (one shell variable, escaped via single quotes).
-        // Single-quote-escape: ' -> '\''
-        let escaped = pw.replacingOccurrences(of: "'", with: "'\\''")
-        let body = "#!/bin/bash\nprintf '%s\\n' '\(escaped)'\n"
+        let url = dir.appendingPathComponent("acleaner-askpass-\(UUID().uuidString).sh")
+        let body = """
+        #!/bin/bash
+        exec /usr/bin/osascript \\
+          -e 'set d to display dialog "ACleaner needs your Mac login password to install an update that uses a pkg installer (Microsoft Office, OneDrive, and similar). Press Cancel to skip those updates." default answer "" with title "ACleaner" with hidden answer' \\
+          -e 'text returned of d' 2>/dev/null
+        """
         do {
             try body.write(to: url, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)

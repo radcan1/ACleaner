@@ -1,21 +1,25 @@
 import SwiftUI
 
+// One flat level: every job is a sidebar item, no nested tab bars anywhere.
+// Each item is one linear screen with a single primary action, and Cmd-1…5
+// jumps straight to it. Cleanup is the no-thinking one-click sweep of
+// self-regenerating junk; Disk Space holds everything that needs review.
 enum ACleanerTool: String, CaseIterable, Identifiable {
-    case updater        = "Updater"
-    case diskDetective  = "Disk Detective"
-    case cleanUninstall = "Clean Uninstall"
-    case startupManager = "Startup Manager"
-    case llmScanner     = "LLM Scanner"
+    case updates   = "Updates"
+    case uninstall = "Uninstall"
+    case cleanup   = "Cleanup"
+    case diskSpace = "Disk Space"
+    case startup   = "Startup"
 
     var id: String { rawValue }
 
     var icon: String {
         switch self {
-        case .updater:        return "arrow.down.circle"
-        case .diskDetective:  return "internaldrive"
-        case .cleanUninstall: return "trash.slash"
-        case .startupManager: return "power"
-        case .llmScanner:     return "cpu"
+        case .updates:   return "arrow.down.circle"
+        case .uninstall: return "trash.slash"
+        case .cleanup:   return "sparkles"
+        case .diskSpace: return "internaldrive"
+        case .startup:   return "power"
         }
     }
 }
@@ -23,7 +27,8 @@ enum ACleanerTool: String, CaseIterable, Identifiable {
 struct RootView: View {
     let cleanState: AppState
     @EnvironmentObject var updateChecker: UpdateChecker
-    @State private var selected: ACleanerTool? = .updater
+    @StateObject private var selfUpdater = SelfUpdater()
+    @State private var selected: ACleanerTool? = .updates
     @State private var showPermissions: Bool = false
 
     // Pearcleaner's approach: check FDA fresh on every launch, no "acknowledged" flag,
@@ -57,19 +62,20 @@ struct RootView: View {
                 .navigationTitle("ACleaner")
             } detail: {
                 switch selected {
-                case .updater:
+                case .updates:
                     UpdaterView()
-                case .diskDetective:
-                    DiskDetectiveView()
-                case .cleanUninstall:
+                case .uninstall:
                     MainView()
                         .environmentObject(cleanState)
                         .frame(minWidth: 640, minHeight: 480)
-                case .startupManager:
-                    StartupManagerView()
+                case .cleanup:
+                    CleanupView()
                         .frame(minWidth: 640, minHeight: 480)
-                case .llmScanner:
-                    LLMScannerView()
+                case .diskSpace:
+                    DiskScanView()
+                        .frame(minWidth: 640, minHeight: 480)
+                case .startup:
+                    StartupManagerView()
                         .frame(minWidth: 640, minHeight: 480)
                 case nil:
                     Text("Select a tool from the sidebar.")
@@ -78,6 +84,9 @@ struct RootView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+            // Cmd-1…6 jump straight to a sidebar section (VoiceOver-friendly:
+            // no need to navigate to the sidebar list first).
+            .background(sectionShortcuts)
             .accessibilityLabel("ACleaner")
             .onAppear { checkFDA() }
             // Sheet is only opened via ACleaner menu → Privacy & Permissions.
@@ -85,9 +94,9 @@ struct RootView: View {
             .sheet(isPresented: $showPermissions) {
                 PermissionsView { showPermissions = false }
             }
-            // Switch to Clean Uninstall tab when trash watcher detects an app
+            // Switch to Uninstall when trash watcher detects an app
             .onReceive(NotificationCenter.default.publisher(for: .acleanerShowCleanUninstall)) { _ in
-                selected = .cleanUninstall
+                selected = .uninstall
             }
             // Open permissions sheet from the menu bar item
             .onReceive(NotificationCenter.default.publisher(for: .acleanerShowPermissions)) { _ in
@@ -99,12 +108,26 @@ struct RootView: View {
 
     // MARK: - FDA banner
 
+    /// Invisible buttons carrying the Cmd-1…6 section shortcuts. Hidden from
+    /// VoiceOver — the shortcuts themselves are the accessibility feature.
+    private var sectionShortcuts: some View {
+        ZStack {
+            ForEach(Array(ACleanerTool.allCases.enumerated()), id: \.element.id) { index, tool in
+                Button("") { selected = tool }
+                    .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
+            }
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .accessibilityHidden(true)
+    }
+
     private var fdaBanner: some View {
         HStack(spacing: 10) {
             Image(systemName: "lock.shield.fill")
                 .foregroundColor(.orange)
                 .accessibilityHidden(true)
-            Text("Full Disk Access not granted — Disk Detective and Clean Uninstall may not work correctly.")
+            Text("Full Disk Access not granted — disk scans and uninstalls may not work correctly.")
                 .fontWeight(.medium)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer()
@@ -123,7 +146,7 @@ struct RootView: View {
         .padding(.vertical, 10)
         .background(Color.orange.opacity(0.1))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Full Disk Access not granted. Disk Detective and Clean Uninstall need this permission to scan your Library folders. Press Open Settings to grant it in System Settings, then press Check Again once done.")
+        .accessibilityLabel("Full Disk Access not granted. Disk scans and uninstalls need this permission to scan your Library folders. Press Open Settings to grant it in System Settings, then press Check Again once done.")
     }
 
     // MARK: - Update banner
@@ -133,29 +156,78 @@ struct RootView: View {
             Image(systemName: "arrow.down.circle.fill")
                 .foregroundColor(.accentColor)
                 .accessibilityHidden(true)
-            Text("ACleaner \(version) is available")
-                .fontWeight(.medium)
-            Spacer()
-            Button("Download Update") {
-                NSWorkspace.shared.open(updateChecker.releasePageURL)
+
+            switch selfUpdater.state {
+            case .idle:
+                Text("ACleaner \(version) is available")
+                    .fontWeight(.medium)
+                Spacer()
+                Button("Update Now") {
+                    Task { await selfUpdater.updateNow(to: version) }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .accessibilityHint("Downloads and installs the update in the background, then relaunches ACleaner. No browser needed.")
+            case .downloading(let percent):
+                Text("Downloading ACleaner \(version)… \(percent)%")
+                    .fontWeight(.medium)
+                Spacer()
+            case .installing:
+                Text("Installing ACleaner \(version)…")
+                    .fontWeight(.medium)
+                Spacer()
+            case .failed(let message):
+                Text("Update failed: \(message)")
+                    .fontWeight(.medium)
+                    .lineLimit(2)
+                Spacer()
+                Button("Retry") {
+                    Task { await selfUpdater.updateNow(to: version) }
+                }
+                .controlSize(.small)
+                Button("Open GitHub") {
+                    NSWorkspace.shared.open(updateChecker.releasePageURL)
+                }
+                .controlSize(.small)
+                .accessibilityHint("Fallback: opens the releases page in your browser.")
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .accessibilityHint("Opens the GitHub releases page in your browser.")
-            Button {
-                updateChecker.dismiss()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.caption)
+
+            if !updateInProgress {
+                Button {
+                    updateChecker.dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Dismiss update notification")
             }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Dismiss update notification")
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
         .background(Color.accentColor.opacity(0.1))
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Update available: ACleaner \(version). Download Update button.")
+        .accessibilityLabel(bannerAccessibilityLabel(version: version))
+    }
+
+    private var updateInProgress: Bool {
+        switch selfUpdater.state {
+        case .downloading, .installing: return true
+        case .idle, .failed:            return false
+        }
+    }
+
+    private func bannerAccessibilityLabel(version: String) -> String {
+        switch selfUpdater.state {
+        case .idle:
+            return "Update available: ACleaner \(version). Update Now button."
+        case .downloading(let percent):
+            return "Downloading ACleaner \(version). \(percent) percent."
+        case .installing:
+            return "Installing ACleaner \(version)."
+        case .failed(let message):
+            return "Update failed. \(message). Retry and Open GitHub buttons."
+        }
     }
 
     // MARK: - FDA check
